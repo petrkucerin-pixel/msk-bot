@@ -73,6 +73,74 @@ CADNUM_RE = re.compile(r"\b\d{2}:\d{2}:\d{6,7}:\d+\b")
 NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
 
+# ================== DMS HELPERS ==================
+# Поддерживаемые форматы ГМС:
+#   77 05 28  /  77 05 28.5
+#   77°05'28"  /  77°05'28.5"
+#   77-05-28
+#   77d05m28s
+DMS_LINE_RE = re.compile(
+    r"([-+]?\d+)[°\-d\s]+"   # градусы
+    r"(\d+)['\-m\s]+"         # минуты
+    r"([\d.]+)[\"s]?"         # секунды
+    r"\s*"
+    r"([NSEWnsew])?"          # опциональная буква стороны света
+)
+
+def dms_to_dd(deg: str, mn: str, sec: str, hemi: str = "") -> float:
+    d = float(deg)
+    m = float(mn)
+    s = float(sec)
+    dd = abs(d) + m / 60.0 + s / 3600.0
+    if d < 0 or hemi.upper() in ("S", "W"):
+        dd = -dd
+    return dd
+
+def parse_dms_line(line: str) -> Optional[Tuple[float, float]]:
+    """Парсит строку с двумя ГМС-координатами. Возвращает (x, y) или None."""
+    matches = DMS_LINE_RE.findall(line)
+    if len(matches) >= 2:
+        x = dms_to_dd(*matches[0])
+        y = dms_to_dd(*matches[1])
+        return (x, y)
+    return None
+
+def parse_points_auto(text: str) -> List[Tuple[float, float]]:
+    """Автоопределение формата: сначала пробуем ГМС, затем десятичные."""
+    pts: List[Tuple[float, float]] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Проверяем, похоже ли на ГМС (есть °, ', ", d, m, s или 3+ числа)
+        nums_in_line = NUM_RE.findall(line)
+        has_dms_marker = any(c in line for c in "°'\"dms")
+        if has_dms_marker or len(nums_in_line) >= 3:
+            pt = parse_dms_line(line)
+            if pt:
+                pts.append(pt)
+                continue
+        # Иначе — десятичные
+        if len(nums_in_line) >= 2:
+            x = _clean_num(nums_in_line[0])
+            y = _clean_num(nums_in_line[1])
+            if x is not None and y is not None:
+                pts.append((x, y))
+    # Если построчно ничего не нашли — пробуем весь текст как одну строку
+    if not pts:
+        pt = parse_dms_line(text)
+        if pt:
+            pts.append(pt)
+        else:
+            nums = NUM_RE.findall(text or "")
+            if len(nums) >= 2:
+                x = _clean_num(nums[0])
+                y = _clean_num(nums[1])
+                if x is not None and y is not None:
+                    pts.append((x, y))
+    return pts
+
+
 # ================== CRS OPTIONS (SHORT ASCII IDS ONLY!) ==================
 # callback_data must be <= 64 bytes
 CRS_OPTIONS: Dict[str, Dict[str, str]] = {
@@ -116,19 +184,19 @@ async def safe_answer(q) -> None:
         pass
 
 
-async def safe_edit(q, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
+async def safe_edit(q, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None, parse_mode: Optional[str] = None) -> None:
     try:
-        await q.edit_message_text(text, reply_markup=reply_markup)
+        await q.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except BadRequest as e:
         logger.warning(f"safe_edit BadRequest: {e}")
         try:
-            await q.message.reply_text(text, reply_markup=reply_markup)
+            await q.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         except Exception as e2:
             logger.warning(f"safe_edit fallback failed: {e2}")
     except Exception as e:
         logger.warning(f"safe_edit error: {e}")
         try:
-            await q.message.reply_text(text, reply_markup=reply_markup)
+            await q.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         except Exception as e2:
             logger.warning(f"safe_edit fallback failed: {e2}")
 
@@ -546,8 +614,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["awaiting"] = "coords_input"
         await safe_edit(
             q,
-            "✅ Настройки готовы. Пришли координаты — выбери способ:",
+            "✅ Настройки готовы. Выбери способ ввода координат.\n\n"
+            "Поддерживаются форматы:\n"
+            "• Десятичные: <pre>77.091111 63.228889</pre>\n"
+            "• ГМС: <pre>77 05 28  63 13 44</pre>\n"
+            "• Метры: <pre>72853345 551668</pre>",
             reply_markup=kb_coords_ready(),
+            parse_mode="HTML",
         )
         return
 
@@ -555,8 +628,18 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["awaiting"] = "coords_manual"
         await safe_edit(
             q,
-            "✍️ Пришли координаты текстом.\nКаждая строка: X Y (или X;Y)\nПример:\n72853345 551668\n72853400 551700",
+            "✍️ Пришли координаты — каждая точка на отдельной строке.\n\n"
+            "Поддерживаемые форматы:\n\n"
+            "Десятичные градусы:\n"
+            "<pre>77.091111 63.228889</pre>\n\n"
+            "Градусы минуты секунды (ГМС):\n"
+            "<pre>77 05 28  63 13 44</pre>\n"
+            "<pre>77°05'28\" 63°13'44\"</pre>\n\n"
+            "Прямоугольные (метры):\n"
+            "<pre>72853345 551668</pre>\n\n"
+            "Несколько точек — каждая с новой строки.",
             reply_markup=kb_coords_ready(),
+            parse_mode="HTML",
         )
         return
 
@@ -618,7 +701,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=kb_root(),
             )
             return
-        pts = parse_points_from_text(text)
+        pts = parse_points_auto(text)
         if not pts:
             await update.message.reply_text(
                 "Не вижу координат. Пример формата:\n72853345 551668\n72853400 551700"
