@@ -77,10 +77,12 @@ HELP_TEXT = (
     "Команды:\n"
     "/start — меню\n"
     "/menu — меню\n"
+    "/reset — очистить историю разговора\n"
+    "/usage — сколько запросов использовано сегодня\n"
     "/help — помощь\n\n"
-    "Пересчёт координат: выбираешь исходную/конечную СК и формат вывода, "
-    "потом присылаешь координаты (текст/фото/файл txt/csv).\n"
-    "Кадастр: присылай КН текстом/фото/файлом.\n"
+    "Просто пиши вопрос в чат — отвечу как коллега-маркшейдер.\n"
+    "Пересчёт координат и кадастр — через кнопки меню.\n"
+    f"Лимит: {DAILY_LIMIT} запросов в день. По вопросам: {ADMIN_CONTACT}"
 )
 
 
@@ -505,6 +507,25 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(HELP_TEXT)
+
+
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    used, limit = get_usage(update.effective_user.id)
+    remaining = limit - used
+    await update.message.reply_text(
+        f"📊 Использовано запросов сегодня: {used}/{limit}\n"
+        f"Осталось: {remaining}\n\n"
+        f"Лимит обновляется каждый день в полночь.\n"
+        f"По вопросам: {ADMIN_CONTACT}"
+    )
+
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("chat_history", None)
+    await update.message.reply_text(
+        "🔄 История разговора очищена. Начнём с чистого листа!",
+        reply_markup=kb_root()
+    )
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -966,7 +987,19 @@ async def do_transform_and_respond(
 
 async def handle_expert_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """Диалог с экспертом-маркшейдером через Claude."""
-    register_user(update.effective_user.id)
+    user_id = update.effective_user.id
+    register_user(user_id)
+
+    # Проверяем лимит
+    allowed, used, limit = check_and_increment(user_id)
+    if not allowed:
+        await update.message.reply_text(
+            f"⚠️ Ты исчерпал дневной лимит запросов ({limit}/день).\n\n"
+            f"Лимит обновится в полночь.\n"
+            f"Для увеличения лимита напиши: {ADMIN_CONTACT}"
+        )
+        return
+
     # Храним историю диалога в user_data
     history = context.user_data.get("chat_history", [])
     history.append({"role": "user", "content": text})
@@ -1001,6 +1034,58 @@ async def handle_expert_chat(update: Update, context: ContextTypes.DEFAULT_TYPE,
 # ================== USERS STORAGE ==================
 USERS_FILE = "users.json"
 SEEN_DOCS_FILE = "seen_docs.json"
+
+# ================== RATE LIMITING ==================
+USAGE_FILE = "usage.json"
+DAILY_LIMIT = 20
+ADMIN_CONTACT = "@pitpen72"
+
+def load_usage() -> dict:
+    try:
+        with open(USAGE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_usage(usage: dict) -> None:
+    try:
+        with open(USAGE_FILE, "w") as f:
+            json.dump(usage, f)
+    except Exception as e:
+        logger.warning(f"save_usage error: {e}")
+
+def check_and_increment(user_id: int) -> tuple:
+    """
+    Проверяет лимит и увеличивает счётчик.
+    Возвращает (allowed: bool, used: int, limit: int)
+    """
+    today = date.today().isoformat()
+    usage = load_usage()
+    key = str(user_id)
+
+    user_data = usage.get(key, {})
+    if user_data.get("date") != today:
+        user_data = {"date": today, "count": 0}
+
+    count = user_data["count"]
+    if count >= DAILY_LIMIT:
+        return False, count, DAILY_LIMIT
+
+    user_data["count"] = count + 1
+    usage[key] = user_data
+    save_usage(usage)
+    return True, user_data["count"], DAILY_LIMIT
+
+def get_usage(user_id: int) -> tuple:
+    """Возвращает (used, limit) без изменения счётчика."""
+    today = date.today().isoformat()
+    usage = load_usage()
+    user_data = usage.get(str(user_id), {})
+    if user_data.get("date") != today:
+        return 0, DAILY_LIMIT
+    return user_data.get("count", 0), DAILY_LIMIT
+
+
 
 def load_users() -> set:
     try:
@@ -1156,6 +1241,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("usage", usage_command))
+    app.add_handler(CommandHandler("reset", reset_command))
 
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
