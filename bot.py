@@ -385,24 +385,84 @@ def make_csv_bytes(points: List[Tuple[float, float]]) -> bytes:
 
 
 # ================== CADASTRE ==================
-async def fetch_nspd_info(cadnum: str) -> Dict[str, Any]:
-    url = "https://nspd.gov.ru/api/geoportal/v2/search/geoportal"
-    params = {"thematicSearchId": "1", "query": cadnum}
+async def fetch_cadaster_info(cadnum: str) -> Dict[str, Any]:
+    """
+    Запрашивает сведения через публичный API ПКК (pkk.rosreestr.ru).
+    Возвращает dict с полями объекта или пустой dict если не найден.
+    """
+    # Поиск объекта по КН
+    search_url = "https://pkk.rosreestr.ru/api/features/1"
+    params = {
+        "text": cadnum,
+        "limit": "1",
+        "skip": "0",
+        "inPoint": "false",
+    }
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://nspd.gov.ru/map?thematic=PKK",
+        "Referer": "https://pkk.rosreestr.ru/",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "ru-RU,ru;q=0.9",
-        "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120"',
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
+        "Origin": "https://pkk.rosreestr.ru",
     }
     timeout = httpx.Timeout(20.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False) as c:
-        r = await c.get(url, params=params, headers=headers)
+        r = await c.get(search_url, params=params, headers=headers)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+
+    features = data.get("features") or []
+    if not features:
+        return {}
+
+    feature = features[0]
+    attrs = feature.get("attrs") or {}
+
+    # Пытаемся получить детальную карточку
+    cn = attrs.get("cn") or cadnum
+    detail_url = f"https://pkk.rosreestr.ru/api/features/1/{cn.replace(':', '%3A')}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False) as c:
+            rd = await c.get(detail_url, headers=headers)
+            if rd.status_code == 200:
+                detail = rd.json()
+                attrs = (detail.get("feature") or {}).get("attrs") or attrs
+    except Exception:
+        pass
+
+    return attrs
+
+
+def format_cadaster_attrs(attrs: Dict[str, Any], cadnum: str) -> str:
+    """Форматирует атрибуты в читаемый текст."""
+    if not attrs:
+        return f"По КН {cadnum} сведения не найдены в открытых источниках."
+
+    lines = ["📋 Сведения по КН: " + cadnum, ""]
+
+    field_map = [
+        ("cn",          "Кадастровый номер"),
+        ("address",     "Адрес"),
+        ("area_value",  "Площадь"),
+        ("area_unit",   "Единица площади"),
+        ("category_type", "Категория земель"),
+        ("util_by_doc", "Разрешённое использование"),
+        ("util_code",   "Код использования"),
+        ("land_record_type", "Тип объекта"),
+        ("statecd",     "Статус"),
+        ("rifr",        "Кадастровая стоимость"),
+        ("reestr_date", "Дата постановки на учёт"),
+        ("cad_unit",    "Кадастровый округ"),
+        ("region_name", "Регион"),
+    ]
+
+    for key, label in field_map:
+        val = attrs.get(key)
+        if val not in (None, "", 0):
+            lines.append(f"• {label}: {val}")
+
+    lines.append("\n🔗 Источник: pkk.rosreestr.ru")
+    return "\n".join(lines)
 
 
 def parse_cadnums_from_text(text: str) -> List[str]:
@@ -725,10 +785,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         cad = cadnums[0]
         await update.message.reply_text(f"🔍 Запрашиваю сведения по КН: {cad} …")
         try:
-            data_json = await fetch_nspd_info(cad)
-            text_out = str(data_json)
-            if len(text_out) > 1500:
-                text_out = text_out[:1500] + "…"
+            attrs = await fetch_cadaster_info(cad)
+            text_out = format_cadaster_attrs(attrs, cad)
             await update.message.reply_text(text_out)
         except Exception as e:
             await update.message.reply_text(f"Не смог получить сведения: {e}")
