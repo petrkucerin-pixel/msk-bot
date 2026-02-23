@@ -784,12 +784,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         cad = cadnums[0]
         await update.message.reply_text(f"🔍 Запрашиваю сведения по КН: {cad} …")
-        try:
-            attrs = await fetch_cadaster_info(cad)
-            text_out = format_cadaster_attrs(attrs, cad)
-            await update.message.reply_text(text_out)
-        except Exception as e:
-            await update.message.reply_text(f"Не смог получить сведения: {e}")
+        cad_encoded = cad.replace(":", "%3A")
+        pkk_url = f"https://nspd.gov.ru/map?thematic=PKK&query={cad_encoded}"
+        text_out = (
+            f"📋 Кадастровый номер: <b>{cad}</b>\n\n"
+            f"Открытые сведения доступны на Публичной кадастровой карте:\n"
+            f'<a href="{pkk_url}">Открыть на ПКК (nspd.gov.ru)</a>\n\n'
+            f"На карте вы найдёте: границы участка, площадь, категорию земель, "
+            f"разрешённое использование, кадастровую стоимость и статус объекта."
+        )
+        await update.message.reply_text(text_out, parse_mode="HTML", disable_web_page_preview=True)
         return
 
     await update.message.reply_text("Открой /menu", reply_markup=kb_root())
