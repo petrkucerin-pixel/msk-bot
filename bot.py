@@ -1128,19 +1128,31 @@ ND_SEARCH_QUERIES = [
     "маркшейдерский",
     "недропользование",
     "землеустройство",
-    "кадастр",
     "горный отвод",
 ]
 
-async def fetch_pravo_docs(query: str) -> list:
-    """Ищет свежие НД на publication.pravo.gov.ru."""
+# Коды регионов на publication.pravo.gov.ru:
+# 0 = федеральные, 89 = ЯНАО, 51 = Мурманская область
+ND_REGIONS = ["0", "89", "51"]
+
+REGION_LABELS = {
+    "0": "🇷🇺 Федеральный",
+    "89": "❄️ ЯНАО",
+    "51": "🌊 Мурманская обл.",
+}
+
+async def fetch_pravo_docs(query: str, region: str) -> list:
+    """Ищет свежие НД на publication.pravo.gov.ru по запросу и региону."""
     url = "http://publication.pravo.gov.ru/api/Documents"
+    today = date.today().isoformat()
     params = {
         "query": query,
         "pageSize": "10",
         "pageNumber": "1",
         "sortBy": "Date",
         "sortDirection": "desc",
+        "dateFrom": today,  # только с сегодняшнего дня
+        "regionCode": region,
     }
     headers = {"User-Agent": "Mozilla/5.0 msk-bot/1.0"}
     timeout = httpx.Timeout(30.0, connect=15.0)
@@ -1151,10 +1163,17 @@ async def fetch_pravo_docs(query: str) -> list:
                 data = r.json()
                 return data.get("items") or data.get("documents") or []
     except Exception as e:
-        logger.warning(f"fetch_pravo_docs error ({query}): {e}")
+        logger.warning(f"fetch_pravo_docs error ({query}, region={region}): {e}")
     return []
 
-def format_nd_notification(doc: dict) -> str:
+def is_doc_fresh(doc: dict) -> bool:
+    """Проверяет что документ опубликован сегодня."""
+    pub_date = doc.get("publicationDate") or doc.get("date") or ""
+    if not pub_date:
+        return False
+    return pub_date[:10] == date.today().isoformat()
+
+def format_nd_notification(doc: dict, region: str) -> str:
     """Форматирует уведомление о новом НД."""
     title = doc.get("complexName") or doc.get("name") or doc.get("title") or "Без названия"
     doc_num = doc.get("number") or doc.get("documentNumber") or ""
@@ -1164,10 +1183,12 @@ def format_nd_notification(doc: dict) -> str:
     if pub_date and len(pub_date) >= 10:
         pub_date = pub_date[:10]
 
+    region_label = REGION_LABELS.get(region, region)
     url = f"http://publication.pravo.gov.ru/Document/View/{doc_id}" if doc_id else "http://publication.pravo.gov.ru"
 
     lines = [
-        "📢 Новый нормативный документ",
+        f"📢 Новый нормативный документ",
+        f"🏷 Уровень: {region_label}",
         "",
         f"📄 {title}",
     ]
@@ -1179,22 +1200,23 @@ def format_nd_notification(doc: dict) -> str:
     return "\n".join(lines)
 
 async def check_nd_updates(app) -> None:
-    """Проверяет новые НД и рассылает уведомления."""
+    """Проверяет новые НД за сегодня и рассылает уведомления."""
     logger.info("ND monitoring: checking for updates...")
     seen = load_seen_docs()
-    new_docs = []
+    new_docs = []  # список (doc, region)
 
-    for query in ND_SEARCH_QUERIES:
-        docs = await fetch_pravo_docs(query)
-        for doc in docs:
-            doc_id = str(doc.get("id") or doc.get("documentId") or "")
-            if doc_id and doc_id not in seen:
-                seen.add(doc_id)
-                new_docs.append(doc)
-        await asyncio.sleep(1)  # пауза между запросами
+    for region in ND_REGIONS:
+        for query in ND_SEARCH_QUERIES:
+            docs = await fetch_pravo_docs(query, region)
+            for doc in docs:
+                doc_id = str(doc.get("id") or doc.get("documentId") or "")
+                if doc_id and doc_id not in seen and is_doc_fresh(doc):
+                    seen.add(doc_id)
+                    new_docs.append((doc, region))
+            await asyncio.sleep(0.5)
 
     if not new_docs:
-        logger.info("ND monitoring: no new documents")
+        logger.info("ND monitoring: no new documents today")
         return
 
     save_seen_docs(seen)
@@ -1204,8 +1226,8 @@ async def check_nd_updates(app) -> None:
     if not users:
         return
 
-    for doc in new_docs:
-        text = format_nd_notification(doc)
+    for doc, region in new_docs:
+        text = format_nd_notification(doc, region)
         for user_id in users:
             try:
                 await app.bot.send_message(chat_id=user_id, text=text)
