@@ -1064,14 +1064,17 @@ def check_and_increment(user_id: int) -> tuple:
     key = str(user_id)
 
     user_data = usage.get(key, {})
+    total = user_data.get("total", 0)  # накопленный счётчик за всё время
+
     if user_data.get("date") != today:
-        user_data = {"date": today, "count": 0}
+        user_data = {"date": today, "count": 0, "total": total}
 
     count = user_data["count"]
     if count >= DAILY_LIMIT:
         return False, count, DAILY_LIMIT
 
     user_data["count"] = count + 1
+    user_data["total"] = total + 1
     usage[key] = user_data
     save_usage(usage)
     return True, user_data["count"], DAILY_LIMIT
