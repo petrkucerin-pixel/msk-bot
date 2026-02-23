@@ -6,6 +6,9 @@ import logging
 from io import BytesIO, StringIO
 from typing import Optional, Tuple, List, Dict, Any
 
+import json
+import asyncio
+from datetime import datetime, date
 import httpx
 from dotenv import load_dotenv
 from telegram import (
@@ -482,9 +485,16 @@ def parse_cadnums_from_text(text: str) -> List[str]:
 
 # ================== HANDLERS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_user(update.effective_user.id)
     reset_coords_wizard(context)
     set_mode(context, "none")
-    await update.message.reply_text("Выбери раздел:", reply_markup=kb_root())
+    await update.message.reply_text(
+        "Привет! Я Виктор — маркшейдер с 25-летним стажем.\n"
+        "Помогу с нормативкой, пересчётом координат и кадастром.\n"
+        "Можешь писать вопросы прямо в чат — отвечу как коллега.\n\n"
+        "Выбери раздел или просто напиши вопрос:",
+        reply_markup=kb_root()
+    )
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -956,6 +966,7 @@ async def do_transform_and_respond(
 
 async def handle_expert_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """Диалог с экспертом-маркшейдером через Claude."""
+    register_user(update.effective_user.id)
     # Храним историю диалога в user_data
     history = context.user_data.get("chat_history", [])
     history.append({"role": "user", "content": text})
@@ -986,6 +997,148 @@ async def handle_expert_chat(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text(f"Ошибка при обращении к эксперту: {e}")
 
 
+
+# ================== USERS STORAGE ==================
+USERS_FILE = "users.json"
+SEEN_DOCS_FILE = "seen_docs.json"
+
+def load_users() -> set:
+    try:
+        with open(USERS_FILE, "r") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+def save_users(users: set) -> None:
+    try:
+        with open(USERS_FILE, "w") as f:
+            json.dump(list(users), f)
+    except Exception as e:
+        logger.warning(f"save_users error: {e}")
+
+def register_user(user_id: int) -> None:
+    users = load_users()
+    if user_id not in users:
+        users.add(user_id)
+        save_users(users)
+
+def load_seen_docs() -> set:
+    try:
+        with open(SEEN_DOCS_FILE, "r") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+def save_seen_docs(docs: set) -> None:
+    try:
+        with open(SEEN_DOCS_FILE, "w") as f:
+            json.dump(list(docs), f)
+    except Exception as e:
+        logger.warning(f"save_seen_docs error: {e}")
+
+
+# ================== ND MONITORING ==================
+ND_SEARCH_QUERIES = [
+    "маркшейдерия",
+    "маркшейдерский",
+    "недропользование",
+    "землеустройство",
+    "кадастр",
+    "горный отвод",
+]
+
+async def fetch_pravo_docs(query: str) -> list:
+    """Ищет свежие НД на publication.pravo.gov.ru."""
+    url = "http://publication.pravo.gov.ru/api/Documents"
+    params = {
+        "query": query,
+        "pageSize": "10",
+        "pageNumber": "1",
+        "sortBy": "Date",
+        "sortDirection": "desc",
+    }
+    headers = {"User-Agent": "Mozilla/5.0 msk-bot/1.0"}
+    timeout = httpx.Timeout(30.0, connect=15.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
+            r = await c.get(url, params=params, headers=headers)
+            if r.status_code == 200:
+                data = r.json()
+                return data.get("items") or data.get("documents") or []
+    except Exception as e:
+        logger.warning(f"fetch_pravo_docs error ({query}): {e}")
+    return []
+
+def format_nd_notification(doc: dict) -> str:
+    """Форматирует уведомление о новом НД."""
+    title = doc.get("complexName") or doc.get("name") or doc.get("title") or "Без названия"
+    doc_num = doc.get("number") or doc.get("documentNumber") or ""
+    pub_date = doc.get("publicationDate") or doc.get("date") or ""
+    doc_id = doc.get("id") or doc.get("documentId") or ""
+
+    if pub_date and len(pub_date) >= 10:
+        pub_date = pub_date[:10]
+
+    url = f"http://publication.pravo.gov.ru/Document/View/{doc_id}" if doc_id else "http://publication.pravo.gov.ru"
+
+    lines = [
+        "📢 Новый нормативный документ",
+        "",
+        f"📄 {title}",
+    ]
+    if doc_num:
+        lines.append(f"№ {doc_num}")
+    if pub_date:
+        lines.append(f"📅 Дата публикации: {pub_date}")
+    lines.append(f"🔗 {url}")
+    return "\n".join(lines)
+
+async def check_nd_updates(app) -> None:
+    """Проверяет новые НД и рассылает уведомления."""
+    logger.info("ND monitoring: checking for updates...")
+    seen = load_seen_docs()
+    new_docs = []
+
+    for query in ND_SEARCH_QUERIES:
+        docs = await fetch_pravo_docs(query)
+        for doc in docs:
+            doc_id = str(doc.get("id") or doc.get("documentId") or "")
+            if doc_id and doc_id not in seen:
+                seen.add(doc_id)
+                new_docs.append(doc)
+        await asyncio.sleep(1)  # пауза между запросами
+
+    if not new_docs:
+        logger.info("ND monitoring: no new documents")
+        return
+
+    save_seen_docs(seen)
+    logger.info(f"ND monitoring: found {len(new_docs)} new documents")
+
+    users = load_users()
+    if not users:
+        return
+
+    for doc in new_docs:
+        text = format_nd_notification(doc)
+        for user_id in users:
+            try:
+                await app.bot.send_message(chat_id=user_id, text=text)
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                logger.warning(f"send notification to {user_id} failed: {e}")
+
+async def nd_monitor_loop(app) -> None:
+    """Фоновый цикл мониторинга НД — проверка раз в 12 часов."""
+    await asyncio.sleep(60)  # первый запуск через минуту после старта
+    while True:
+        try:
+            await check_nd_updates(app)
+        except Exception as e:
+            logger.exception(f"ND monitor loop error: {e}")
+        await asyncio.sleep(12 * 60 * 60)  # 12 часов
+
+
 # ================== ERROR HANDLER ==================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled error", exc_info=context.error)
@@ -1010,6 +1163,11 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     app.add_error_handler(error_handler)
+
+    async def post_init(application) -> None:
+        asyncio.create_task(nd_monitor_loop(application))
+
+    app.post_init = post_init
 
     logger.info("msk-bot started")
     app.run_polling(close_loop=False)
