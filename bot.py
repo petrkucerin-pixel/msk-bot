@@ -1,12 +1,20 @@
 import os
 import re
+import csv
 import base64
 import logging
+from io import BytesIO, StringIO
+from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,8 +23,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from anthropic import Anthropic
 
+from anthropic import Anthropic
 from pyproj import CRS, Transformer
 
 
@@ -39,17 +47,14 @@ logging.basicConfig(
 logger = logging.getLogger("msk-bot")
 
 
-# ================== CLAUDE ==================
+# ================== CLAUDE (for photo reading) ==================
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 MODEL = "claude-3-haiku-20240307"
 
 SYSTEM_PROMPT_BASE = (
-    "Ты — профессиональный помощник для маркшейдеров и специалистов по землеустройству "
-    "в организациях добычи газа, конденсата и нефти.\n"
-    "Отвечай строго по делу, кратко и структурировано.\n"
-    "Если не хватает данных — задай уточняющие вопросы.\n"
-    "Если спрашивают про обход требований — предлагай ТОЛЬКО законные варианты "
-    "(альтернативы, согласования, допустимые исключения).\n"
+    "Ты — помощник для маркшейдеров и специалистов по землеустройству.\n"
+    "КРИТИЧНО: при распознавании с фото не выдумывай и не додумывай цифры.\n"
+    "Если цифра/символ неразборчивы — ставь '?' в этом месте.\n"
 )
 
 HELP_TEXT = (
@@ -57,11 +62,9 @@ HELP_TEXT = (
     "/start — меню\n"
     "/menu — меню\n"
     "/help — помощь\n\n"
-    "Координаты: можно фото или ручной ввод. Для пересчёта задай СК строкой:\n"
-    "СК: EPSG:3857 -> EPSG:4326\n"
-    "или\n"
-    "СК: WGS84 -> WebMercator\n\n"
-    "Кадастр: можно фото или ручной ввод (КН в формате 89:35:800113:31)."
+    "Пересчёт координат: выбираешь исходную/конечную СК и формат вывода, "
+    "потом присылаешь координаты (текст/фото/файл txt/csv).\n"
+    "Кадастр: присылай КН текстом/фото/файлом.\n"
 )
 
 
@@ -70,67 +73,157 @@ CADNUM_RE = re.compile(r"\b\d{2}:\d{2}:\d{6,7}:\d+\b")
 NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
 
-# ================== CRS ALIASES ==================
-CRS_ALIASES = {
-    "WGS84": "EPSG:4326",
-    "WGS 84": "EPSG:4326",
-    "EPSG4326": "EPSG:4326",
-    "WEBMERCATOR": "EPSG:3857",
-    "WEB MERCATOR": "EPSG:3857",
-    "EPSG3857": "EPSG:3857",
-    "PULKOVO42": "EPSG:4284",   # геогр. Пулково 1942 (если нужно)
-    "GSK2011": "EPSG:7683",    # часто встречается как ГСК-2011 (в proj.db может отличаться)
-    "ГСК2011": "EPSG:7683",
-    "ГСК-2011": "EPSG:7683",
+# ================== CRS PRESETS ==================
+# Важно:
+# - WGS84 географические: EPSG:4326 (lon, lat)
+# - WebMercator: EPSG:3857
+# - СК-42 (Пулково 1942) Гаусс-Крюгер зоны: EPSG:28401..28460 (зона 1..60)
+#
+# Замечание: "СК-42 прямоугольные" = как правило GK в нужной зоне.
+#
+CRS_PRESETS = {
+    "WGS84 (географические)": {"kind": "epsg", "code": "EPSG:4326"},
+    "WebMercator (EPSG:3857)": {"kind": "epsg", "code": "EPSG:3857"},
+    "СК-42 (Гаусс-Крюгер, выбрать зону)": {"kind": "sk42_zone"},
+}
+
+OUTPUT_PRESETS = {
+    "Показать в чате": "chat",
+    "Сгенерировать файл (CSV)": "csv",
 }
 
 
-# ================== KEYBOARDS ==================
+# ================== UI HELPERS ==================
+def kb_nav(back_to: Optional[str], include_menu: bool = True) -> List[List[InlineKeyboardButton]]:
+    row: List[InlineKeyboardButton] = []
+    if back_to:
+        row.append(InlineKeyboardButton("⬅️ Назад", callback_data=back_to))
+    if include_menu:
+        row.append(InlineKeyboardButton("🏠 Меню", callback_data="nav:root"))
+    return [row] if row else []
+
+
 def kb_root() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("🏗️ Маркшейдерия", callback_data="root:mine")],
         [InlineKeyboardButton("🗺️ Землеустройство", callback_data="root:land")],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_mine() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("📐 Пересчёт координат", callback_data="mine:coords")],
         [InlineKeyboardButton("📚 Нормативная документация", callback_data="mine:norms")],
         [InlineKeyboardButton("🧾 Составление отчёта", callback_data="mine:report")],
-        [InlineKeyboardButton("🏠 Меню", callback_data="nav:root")],
-    ])
+    ]
+    rows += kb_nav(back_to="nav:root", include_menu=True)
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_land() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("🏷️ Инфо по кадастровому номеру", callback_data="land:cadnum")],
         [InlineKeyboardButton("📚 Нормативная документация", callback_data="land:norms")],
-        [InlineKeyboardButton("🏠 Меню", callback_data="nav:root")],
-    ])
+    ]
+    rows += kb_nav(back_to="nav:root", include_menu=True)
+    return InlineKeyboardMarkup(rows)
 
 
-def kb_confirm(kind: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm:{kind}:ok")],
-        [InlineKeyboardButton("✏️ Исправить вручную", callback_data=f"confirm:{kind}:edit")],
-        [InlineKeyboardButton("🏠 Меню", callback_data="nav:root")],
-    ])
+def kb_coords_main() -> InlineKeyboardMarkup:
+    # Мастер-меню координат
+    src = _get(context_key="coords_src_label", default="не выбрана")
+    dst = _get(context_key="coords_dst_label", default="не выбрана")
+    out = _get(context_key="coords_out_mode", default="не выбран")
+
+    rows = [
+        [InlineKeyboardButton(f"1) Исходная СК: {src}", callback_data="coords:set_src")],
+        [InlineKeyboardButton(f"2) Конечная СК: {dst}", callback_data="coords:set_dst")],
+        [InlineKeyboardButton(f"3) Вывод: {out}", callback_data="coords:set_out")],
+        [InlineKeyboardButton("✅ Готово: прислать координаты", callback_data="coords:ready")],
+    ]
+    rows += kb_nav(back_to="nav:mine", include_menu=True)
+    return InlineKeyboardMarkup(rows)
 
 
-def kb_mode_actions_coords() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Задать СК", callback_data="manual:set_crs")],
-        [InlineKeyboardButton("✍️ Ввести координаты вручную", callback_data="manual:coords")],
-        [InlineKeyboardButton("🏠 Меню", callback_data="nav:root")],
-    ])
+def kb_coords_pick_crs(kind: str) -> InlineKeyboardMarkup:
+    # kind = "src" or "dst"
+    rows: List[List[InlineKeyboardButton]] = []
+    for label in CRS_PRESETS.keys():
+        rows.append([InlineKeyboardButton(label, callback_data=f"coords:pick_{kind}:{label}")])
+    rows += kb_nav(back_to="coords:home", include_menu=True)
+    return InlineKeyboardMarkup(rows)
 
 
-def kb_mode_actions_cadnum() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✍️ Ввести КН вручную", callback_data="manual:cadnum")],
-        [InlineKeyboardButton("🏠 Меню", callback_data="nav:root")],
-    ])
+def kb_coords_pick_zone(kind: str) -> InlineKeyboardMarkup:
+    # Показываем зоны 1..30 и 31..60 переключалками
+    # Чтобы не городить пагинацию - две страницы
+    page = _get("coords_zone_page", "1")
+    page = page if page in ("1", "2") else "1"
+    start = 1 if page == "1" else 31
+    end = 30 if page == "1" else 60
+
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for z in range(start, end + 1):
+        row.append(InlineKeyboardButton(str(z), callback_data=f"coords:zone_{kind}:{z}"))
+        if len(row) == 6:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    switch_row = []
+    if page == "1":
+        switch_row.append(InlineKeyboardButton("➡️ 31–60", callback_data="coords:zone_page:2"))
+    else:
+        switch_row.append(InlineKeyboardButton("⬅️ 1–30", callback_data="coords:zone_page:1"))
+    rows.append(switch_row)
+
+    rows += kb_nav(back_to="coords:set_src" if kind == "src" else "coords:set_dst", include_menu=True)
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_coords_pick_output() -> InlineKeyboardMarkup:
+    rows = []
+    for label, mode in OUTPUT_PRESETS.items():
+        rows.append([InlineKeyboardButton(label, callback_data=f"coords:out:{mode}")])
+    rows += kb_nav(back_to="coords:home", include_menu=True)
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_land_cadnum() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("✅ Ввести КН вручную", callback_data="cad:manual")],
+        [InlineKeyboardButton("📷 Прислать фото КН", callback_data="cad:photo_help")],
+        [InlineKeyboardButton("📎 Прислать файл (txt/csv) с КН", callback_data="cad:file_help")],
+    ]
+    rows += kb_nav(back_to="nav:land", include_menu=True)
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_coords_ready() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("✍️ Ввести координаты вручную", callback_data="coords:manual")],
+        [InlineKeyboardButton("📷 Прислать фото координат", callback_data="coords:photo_help")],
+        [InlineKeyboardButton("📎 Прислать файл (txt/csv) с координатами", callback_data="coords:file_help")],
+        [InlineKeyboardButton("🔁 Сменить настройки СК/вывода", callback_data="coords:home")],
+    ]
+    rows += kb_nav(back_to="coords:home", include_menu=True)
+    return InlineKeyboardMarkup(rows)
+
+
+# ================== small context helper ==================
+# (чтобы kb_coords_main мог брать значения даже когда context не передан)
+_GLOBAL_CTX: Dict[str, Any] = {}
+
+
+def _set(context_key: str, value: Any) -> None:
+    _GLOBAL_CTX[context_key] = value
+
+
+def _get(context_key: str, default: Any = None) -> Any:
+    return _GLOBAL_CTX.get(context_key, default)
 
 
 # ================== STATE ==================
@@ -142,52 +235,29 @@ def get_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
     return context.user_data.get("mode", "none")
 
 
-def clear_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop("pending", None)
-    context.user_data.pop("awaiting_manual_input", None)
-
-
-def clear_photo_stash(context: ContextTypes.DEFAULT_TYPE) -> None:
+def reset_coords_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("coords_src", None)
+    context.user_data.pop("coords_dst", None)
+    context.user_data.pop("coords_src_label", None)
+    context.user_data.pop("coords_dst_label", None)
+    context.user_data.pop("coords_out_mode", None)
+    context.user_data.pop("coords_zone_page", None)
+    context.user_data.pop("awaiting", None)
     context.user_data.pop("last_photo_b64", None)
 
 
-def set_crs_pair(context: ContextTypes.DEFAULT_TYPE, src: str, dst: str) -> None:
-    context.user_data["coords_src_crs"] = src
-    context.user_data["coords_dst_crs"] = dst
+def sync_globals_from_context(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # чтобы kb_coords_main мог показать значения
+    _set("coords_src_label", context.user_data.get("coords_src_label", "не выбрана"))
+    _set("coords_dst_label", context.user_data.get("coords_dst_label", "не выбрана"))
+    _set("coords_out_mode", context.user_data.get("coords_out_mode", "не выбран"))
+    _set("coords_zone_page", context.user_data.get("coords_zone_page", "1"))
 
 
-def get_crs_pair(context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[str], Optional[str]]:
-    return context.user_data.get("coords_src_crs"), context.user_data.get("coords_dst_crs")
-
-
-# ================== CLAUDE CALLS ==================
-def ask_claude_text(text: str, system_add: str = "") -> str:
-    text = (text or "").strip()
-    if not text:
-        return "Пустой запрос."
-
-    system = SYSTEM_PROMPT_BASE + (("\n" + system_add.strip()) if system_add.strip() else "")
-
-    try:
-        resp = client.messages.create(
-            model=MODEL,
-            max_tokens=900,
-            system=system,
-            messages=[{"role": "user", "content": text}],
-        )
-        out = []
-        for block in resp.content:
-            if getattr(block, "type", None) == "text":
-                out.append(block.text)
-        return "\n".join(out).strip() or "Не получил текстовый ответ от модели."
-    except Exception as e:
-        logger.exception("Claude error (text)")
-        return f"Ошибка Claude: {e}"
-
-
-def ask_claude_with_image(prompt_text: str, image_b64: str, system_add: str = "") -> str:
-    prompt_text = (prompt_text or "").strip() or "Распознай текст/цифры на изображении."
-    system = SYSTEM_PROMPT_BASE + (("\n" + system_add.strip()) if system_add.strip() else "")
+# ================== CLAUDE (photo) ==================
+def ask_claude_with_image(prompt_text: str, image_b64: str, system_add: str) -> str:
+    prompt_text = (prompt_text or "").strip() or "Распознай данные."
+    system = SYSTEM_PROMPT_BASE + "\n" + (system_add or "")
 
     content = [
         {
@@ -201,24 +271,21 @@ def ask_claude_with_image(prompt_text: str, image_b64: str, system_add: str = ""
         {"type": "text", "text": prompt_text},
     ]
 
-    try:
-        resp = client.messages.create(
-            model=MODEL,
-            max_tokens=900,
-            system=system,
-            messages=[{"role": "user", "content": content}],
-        )
-        out = []
-        for block in resp.content:
-            if getattr(block, "type", None) == "text":
-                out.append(block.text)
-        return "\n".join(out).strip() or "Не получил текстовый ответ от модели."
-    except Exception as e:
-        logger.exception("Claude error (image)")
-        return f"Ошибка Claude (image): {e}"
+    resp = client.messages.create(
+        model=MODEL,
+        max_tokens=900,
+        system=system,
+        messages=[{"role": "user", "content": content}],
+    )
+
+    out = []
+    for block in resp.content:
+        if getattr(block, "type", None) == "text":
+            out.append(block.text)
+    return ("\n".join(out)).strip()
 
 
-# ================== PARSING HELPERS ==================
+# ================== COORD PARSING ==================
 def _clean_num(s: str) -> Optional[float]:
     try:
         return float(s.replace(",", "."))
@@ -226,90 +293,24 @@ def _clean_num(s: str) -> Optional[float]:
         return None
 
 
-def parse_xy_from_text(text: str) -> Tuple[Optional[float], Optional[float]]:
-    t = text or ""
-    mx = re.search(r"[XХ]\s*[:=]\s*([-+]?\d+(?:[.,]\d+)?)", t, re.IGNORECASE)
-    my = re.search(r"[YУ]\s*[:=]\s*([-+]?\d+(?:[.,]\d+)?)", t, re.IGNORECASE)
-    x = _clean_num(mx.group(1)) if mx else None
-    y = _clean_num(my.group(1)) if my else None
-    if x is not None and y is not None:
-        return x, y
-
-    nums = NUM_RE.findall(t)
-    if len(nums) >= 2:
-        return _clean_num(nums[0]), _clean_num(nums[1])
-    return None, None
-
-
 def parse_points_from_text(text: str) -> List[Tuple[float, float]]:
-    """
-    Принимает:
-    - одну точку: "X=... Y=..." или "x y"
-    - несколько строк: каждая строка содержит минимум 2 числа (возьмём первые 2)
-    """
-    points: List[Tuple[float, float]] = []
-
-    # Если есть явное X=...Y=...
-    x, y = parse_xy_from_text(text)
-    if x is not None and y is not None:
-        return [(x, y)]
-
-    # Иначе по строкам: берём первые два числа в каждой строке
+    pts: List[Tuple[float, float]] = []
     for line in (text or "").splitlines():
         nums = NUM_RE.findall(line)
         if len(nums) >= 2:
-            x2 = _clean_num(nums[0])
-            y2 = _clean_num(nums[1])
-            if x2 is not None and y2 is not None:
-                points.append((x2, y2))
-    return points
-
-
-def parse_cadnums_from_text(text: str) -> List[str]:
-    return sorted(set(CADNUM_RE.findall(text or "")))
-
-
-def is_plausible_coord(x: Optional[float], y: Optional[float]) -> bool:
-    if x is None or y is None:
-        return False
-    return (abs(x) > 1 and abs(y) > 1)
-
-
-def normalize_crs_input(s: str) -> str:
-    s2 = (s or "").strip()
-    if not s2:
-        return s2
-    up = s2.upper().replace(" ", "")
-    if up in CRS_ALIASES:
-        return CRS_ALIASES[up]
-    # если человек написал "EPSG:XXXX" оставляем как есть
-    return s2
-
-
-def parse_crs_pair_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Ожидается:
-      "СК: <src> -> <dst>"
-    или:
-      "<src> -> <dst>"
-    """
-    t = (text or "").strip()
-    t = t.replace("—", "->").replace("→", "->")
-    t = re.sub(r"^\s*СК\s*:\s*", "", t, flags=re.IGNORECASE)
-    if "->" not in t:
-        return None, None
-    left, right = t.split("->", 1)
-    src = normalize_crs_input(left.strip())
-    dst = normalize_crs_input(right.strip())
-    if not src or not dst:
-        return None, None
-    return src, dst
-
-
-def build_transformer(src: str, dst: str) -> Transformer:
-    crs_src = CRS.from_user_input(src)
-    crs_dst = CRS.from_user_input(dst)
-    return Transformer.from_crs(crs_src, crs_dst, always_xy=True)
+            x = _clean_num(nums[0])
+            y = _clean_num(nums[1])
+            if x is not None and y is not None:
+                pts.append((x, y))
+    # если одной строкой через пробел
+    if not pts:
+        nums = NUM_RE.findall(text or "")
+        if len(nums) >= 2:
+            x = _clean_num(nums[0])
+            y = _clean_num(nums[1])
+            if x is not None and y is not None:
+                pts.append((x, y))
+    return pts
 
 
 def format_points_table(points: List[Tuple[float, float]]) -> str:
@@ -319,22 +320,39 @@ def format_points_table(points: List[Tuple[float, float]]) -> str:
     return "\n".join(lines)
 
 
-# ================== CADASTRE (NSPD) ==================
+def transformer_from_user_codes(src_code: str, dst_code: str) -> Transformer:
+    crs_src = CRS.from_user_input(src_code)
+    crs_dst = CRS.from_user_input(dst_code)
+    return Transformer.from_crs(crs_src, crs_dst, always_xy=True)
+
+
+def transform_points(points: List[Tuple[float, float]], src_code: str, dst_code: str) -> List[Tuple[float, float]]:
+    tr = transformer_from_user_codes(src_code, dst_code)
+    out: List[Tuple[float, float]] = []
+    for x, y in points:
+        xx, yy = tr.transform(x, y)
+        out.append((xx, yy))
+    return out
+
+
+def make_csv_bytes(points: List[Tuple[float, float]]) -> bytes:
+    sio = StringIO()
+    w = csv.writer(sio, delimiter=";")
+    w.writerow(["N", "X", "Y"])
+    for i, (x, y) in enumerate(points, start=1):
+        w.writerow([i, x, y])
+    return sio.getvalue().encode("utf-8-sig")
+
+
+# ================== CADASTRE ==================
 async def fetch_nspd_info(cadnum: str) -> Dict[str, Any]:
-    """
-    НСПД часто требует Referer. По форумам рабочий урл:
-    https://nspd.gov.ru/api/geoportal/v2/search/geoportal?thematicSearchId=1&query=<КН>
-    """
     url = "https://nspd.gov.ru/api/geoportal/v2/search/geoportal"
     params = {"thematicSearchId": "1", "query": cadnum}
-
     headers = {
-        # реферер часто критичен
         "Referer": "https://nspd.gov.ru/map?thematic=PKK",
         "User-Agent": "msk-bot/1.0 (+telegram)",
         "Accept": "application/json, text/plain, */*",
     }
-
     timeout = httpx.Timeout(20.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
         r = await c.get(url, params=params, headers=headers)
@@ -343,12 +361,9 @@ async def fetch_nspd_info(cadnum: str) -> Dict[str, Any]:
 
 
 def _find_first(d: Any, keys: List[str]) -> Optional[Any]:
-    """
-    Рекурсивно ищем первое значение по набору ключей (case-insensitive).
-    """
     if isinstance(d, dict):
         for k, v in d.items():
-            if k and isinstance(k, str) and k.lower() in keys:
+            if isinstance(k, str) and k.lower() in keys:
                 return v
         for v in d.values():
             got = _find_first(v, keys)
@@ -363,7 +378,6 @@ def _find_first(d: Any, keys: List[str]) -> Optional[Any]:
 
 
 def summarize_nspd_json(cadnum: str, data: Dict[str, Any]) -> str:
-    # Пытаемся вытащить часто встречающиеся поля
     found_cad = _find_first(data, ["cadastralnumber", "cadnum", "cadastr", "cn"])
     address = _find_first(data, ["address", "location", "fulladdress"])
     area = _find_first(data, ["area", "square", "s"])
@@ -375,7 +389,7 @@ def summarize_nspd_json(cadnum: str, data: Dict[str, Any]) -> str:
 
     lines = [f"КН: {cadnum}"]
     if found_cad and str(found_cad) != cadnum:
-        lines.append(f"(В ответе сервисом найдено: {found_cad})")
+        lines.append(f"(Сервис вернул: {found_cad})")
 
     if obj_type:
         lines.append(f"Тип: {obj_type}")
@@ -392,29 +406,30 @@ def summarize_nspd_json(cadnum: str, data: Dict[str, Any]) -> str:
     if cost:
         lines.append(f"Кад. стоимость: {cost}")
 
-    # Если почти ничего не нашли — дадим короткий «сырой» фрагмент
     if len(lines) <= 1:
         raw = str(data)
         if len(raw) > 1400:
             raw = raw[:1400] + "…"
-        lines.append("Не удалось уверенно выделить поля из ответа НСПД. Сырой ответ (обрезан):")
+        lines.append("Не удалось уверенно выделить поля. Сырой ответ (обрезан):")
         lines.append(raw)
 
     return "\n".join(lines)
 
 
+def parse_cadnums_from_text(text: str) -> List[str]:
+    return sorted(set(CADNUM_RE.findall(text or "")))
+
+
 # ================== HANDLERS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    reset_coords_wizard(context)
     set_mode(context, "none")
-    clear_pending(context)
-    clear_photo_stash(context)
     await update.message.reply_text("Выбери раздел:", reply_markup=kb_root())
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    reset_coords_wizard(context)
     set_mode(context, "none")
-    clear_pending(context)
-    clear_photo_stash(context)
     await update.message.reply_text("Меню:", reply_markup=kb_root())
 
 
@@ -431,501 +446,561 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     data = q.data or ""
 
-    # --- меню всегда
+    # global nav
     if data == "nav:root":
+        reset_coords_wizard(context)
         set_mode(context, "none")
-        clear_pending(context)
-        clear_photo_stash(context)
         await q.edit_message_text("Выбери раздел:", reply_markup=kb_root())
         return
 
-    # --- ручной ввод координат/КН/СК
-    if data == "manual:coords":
-        context.user_data["awaiting_manual_input"] = "coords"
-        await q.edit_message_text(
-            "✍️ Ввод координат вручную.\n"
-            "Пришли:\n"
-            "X=72853345 Y=551668\n"
-            "или несколько строк (в каждой строке 2 числа)."
-        )
+    if data == "nav:mine":
+        set_mode(context, "mine")
+        await q.edit_message_text("Маркшейдерия:", reply_markup=kb_mine())
         return
 
-    if data == "manual:cadnum":
-        context.user_data["awaiting_manual_input"] = "cadnum"
-        await q.edit_message_text(
-            "✍️ Ввод кадастрового номера вручную.\n"
-            "Пришли КН в формате:\n"
-            "89:35:800113:31"
-        )
+    if data == "nav:land":
+        set_mode(context, "land")
+        await q.edit_message_text("Землеустройство:", reply_markup=kb_land())
         return
 
-    if data == "manual:set_crs":
-        context.user_data["awaiting_manual_input"] = "set_crs"
-        src, dst = get_crs_pair(context)
-        cur = f"Текущие СК: {src} -> {dst}\n\n" if src and dst else ""
-        await q.edit_message_text(
-            "⚙️ Задать системы координат.\n"
-            f"{cur}"
-            "Пришли строкой:\n"
-            "СК: EPSG:3857 -> EPSG:4326\n"
-            "или:\n"
-            "СК: WGS84 -> WebMercator"
-        )
-        return
-
-    # --- подтверждения
-    if data.startswith("confirm:"):
-        _, kind, action = data.split(":", 2)
-        pending = context.user_data.get("pending")
-
-        if not pending or pending.get("kind") != kind:
-            await q.edit_message_text("Нет данных для подтверждения. Открой /menu")
-            return
-
-        if action == "ok":
-            context.user_data["last_extracted"] = pending
-            context.user_data.pop("pending", None)
-            context.user_data.pop("awaiting_manual_input", None)
-
-            if kind == "coords":
-                x = pending.get("x")
-                y = pending.get("y")
-                await q.edit_message_text(
-                    f"✅ Принято.\nX={x}\nY={y}\n\n"
-                    "Теперь можно:\n"
-                    "1) задать СК: «⚙️ Задать СК»\n"
-                    "2) прислать новые координаты/список — я пересчитаю по заданным СК.",
-                    reply_markup=kb_mode_actions_coords()
-                )
-            else:
-                cad = pending.get("cadnum")
-                await q.edit_message_text(
-                    f"✅ Принято.\nКН: {cad}\n\n"
-                    "Запрашиваю сведения…",
-                    reply_markup=kb_mode_actions_cadnum()
-                )
-                # сразу тянем данные
-                try:
-                    data_json = await fetch_nspd_info(cad)
-                    info = summarize_nspd_json(cad, data_json)
-                    await q.message.reply_text(info, reply_markup=kb_land())
-                except Exception as e:
-                    logger.exception("NSPD fetch failed")
-                    await q.message.reply_text(
-                        "Не смог получить сведения (НСПД может быть недоступен/ограничивает запросы).\n"
-                        f"Ошибка: {e}\n\n"
-                        "Попробуй позже или пришли КН ещё раз.",
-                        reply_markup=kb_land()
-                    )
-            return
-
-        if action == "edit":
-            context.user_data["awaiting_manual_input"] = kind
-            await q.edit_message_text(
-                "✏️ Ок. Пришли одним сообщением правильные данные:\n"
-                "- для координат: `X=... Y=...` или несколько строк (в каждой 2 числа)\n"
-                "- для кадастра: `89:xx:xxxxxx:xxx`"
-            )
-            return
-
-    # --- корневые разделы
+    # root sections
     if data == "root:mine":
         set_mode(context, "mine")
-        clear_pending(context)
         await q.edit_message_text("Маркшейдерия:", reply_markup=kb_mine())
         return
 
     if data == "root:land":
         set_mode(context, "land")
-        clear_pending(context)
         await q.edit_message_text("Землеустройство:", reply_markup=kb_land())
         return
 
-    # --- маркшейдерия
+    # mine menu
     if data == "mine:coords":
         set_mode(context, "mine_coords")
-        clear_pending(context)
-        src, dst = get_crs_pair(context)
-        cur = f"Текущие СК: {src} -> {dst}\n\n" if src and dst else "СК не заданы.\n\n"
+        sync_globals_from_context(context)
         await q.edit_message_text(
-            "📐 Пересчёт координат.\n"
-            f"{cur}"
-            "1) Задай СК кнопкой «⚙️ Задать СК» (один раз)\n"
-            "2) Пришли координаты (текстом или фото)\n\n"
-            "Форматы:\n"
-            "- X=... Y=...\n"
-            "- или список строк (в каждой 2 числа)\n",
-            reply_markup=kb_mode_actions_coords()
+            "📐 Пересчёт координат — настройки.\n"
+            "Сначала выбери исходную/конечную СК и формат вывода.",
+            reply_markup=kb_coords_main()
         )
         return
 
     if data == "mine:norms":
         set_mode(context, "mine_norms")
-        clear_pending(context)
         await q.edit_message_text(
             "📚 Нормативная документация (маркшейдерия).\n"
-            "Напиши, что найти (пункт/тема/документ).",
+            "Пока заглушка (следующим шагом подключим поиск по НД).",
             reply_markup=kb_mine()
         )
         return
 
     if data == "mine:report":
         set_mode(context, "mine_report")
-        clear_pending(context)
         await q.edit_message_text(
-            "🧾 Составление отчёта (Роснедра).\n"
-            "Укажи форму и исходные данные.\n"
-            "(Пока заглушка, генерацию файлов подключим следующим шагом.)",
+            "🧾 Составление отчёта.\n"
+            "Пока заглушка (следующим шагом подключим шаблоны/генерацию).",
             reply_markup=kb_mine()
         )
         return
 
-    # --- землеустройство
+    # land menu
     if data == "land:cadnum":
         set_mode(context, "land_cadnum")
-        clear_pending(context)
+        context.user_data["awaiting"] = None
         await q.edit_message_text(
-            "🏷️ Информация по кадастровому номеру.\n"
-            "Пришли КН текстом или фото.\n"
-            "Я распознаю и попрошу подтвердить — без 'додумывания'.",
-            reply_markup=kb_mode_actions_cadnum()
+            "🏷️ Кадастровый номер.\n"
+            "Можно ввести вручную / прислать фото / прислать файл.",
+            reply_markup=kb_land_cadnum()
         )
         return
 
     if data == "land:norms":
         set_mode(context, "land_norms")
-        clear_pending(context)
         await q.edit_message_text(
             "📚 Нормативная документация (землеустройство).\n"
-            "Напиши запрос (позже добавим список землеустроительных НД).",
+            "Пока заглушка (позже добавим НД и поиск).",
             reply_markup=kb_land()
         )
         return
 
-    await q.edit_message_text("Не понял команду. Открой /menu")
+    # ====== COORDS WIZARD ======
+    if data == "coords:home":
+        set_mode(context, "mine_coords")
+        sync_globals_from_context(context)
+        await q.edit_message_text(
+            "📐 Пересчёт координат — настройки.\n"
+            "Выбери исходную/конечную СК и формат вывода.",
+            reply_markup=kb_coords_main()
+        )
+        return
+
+    if data == "coords:set_src":
+        await q.edit_message_text("Выбери ИСХОДНУЮ систему координат:", reply_markup=kb_coords_pick_crs("src"))
+        return
+
+    if data == "coords:set_dst":
+        await q.edit_message_text("Выбери КОНЕЧНУЮ систему координат:", reply_markup=kb_coords_pick_crs("dst"))
+        return
+
+    if data.startswith("coords:pick_src:") or data.startswith("coords:pick_dst:"):
+        _, pick, rest = data.split(":", 2)  # coords:pick_src:<label>
+        kind = "src" if pick == "pick_src" else "dst"
+        label = rest
+
+        preset = CRS_PRESETS.get(label)
+        if not preset:
+            await q.edit_message_text("Не понял выбор. Открой настройки заново.", reply_markup=kb_coords_main())
+            return
+
+        if preset["kind"] == "epsg":
+            code = preset["code"]
+            if kind == "src":
+                context.user_data["coords_src"] = code
+                context.user_data["coords_src_label"] = label
+            else:
+                context.user_data["coords_dst"] = code
+                context.user_data["coords_dst_label"] = label
+            sync_globals_from_context(context)
+            await q.edit_message_text("✅ Сохранено.", reply_markup=kb_coords_main())
+            return
+
+        if preset["kind"] == "sk42_zone":
+            # нужно выбрать зону
+            context.user_data["coords_zone_page"] = "1"
+            sync_globals_from_context(context)
+            await q.edit_message_text(
+                f"Выбери зону СК-42 (Гаусс-Крюгер) для {'ИСХОДНОЙ' if kind=='src' else 'КОНЕЧНОЙ'} СК:",
+                reply_markup=kb_coords_pick_zone(kind)
+            )
+            return
+
+    if data.startswith("coords:zone_page:"):
+        page = data.split(":")[-1]
+        context.user_data["coords_zone_page"] = page if page in ("1", "2") else "1"
+        sync_globals_from_context(context)
+        # определить, для чего открыта зона? храним временно:
+        # проще: если есть флаг awaiting_zone_kind
+        kind = context.user_data.get("awaiting_zone_kind", "src")
+        await q.edit_message_text(
+            f"Выбери зону СК-42 (Гаусс-Крюгер) для {'ИСХОДНОЙ' if kind=='src' else 'КОНЕЧНОЙ'} СК:",
+            reply_markup=kb_coords_pick_zone(kind)
+        )
+        return
+
+    if data.startswith("coords:zone_src:") or data.startswith("coords:zone_dst:"):
+        # coords:zone_src:7
+        parts = data.split(":")
+        kind = "src" if parts[1] == "zone_src" else "dst"
+        z = int(parts[2])
+
+        if z < 1 or z > 60:
+            await q.edit_message_text("Зона должна быть 1..60", reply_markup=kb_coords_main())
+            return
+
+        epsg = f"EPSG:{28400 + z}"
+        label = f"СК-42 ГК зона {z} (EPSG:{28400+z})"
+
+        if kind == "src":
+            context.user_data["coords_src"] = epsg
+            context.user_data["coords_src_label"] = label
+        else:
+            context.user_data["coords_dst"] = epsg
+            context.user_data["coords_dst_label"] = label
+
+        context.user_data.pop("awaiting_zone_kind", None)
+        sync_globals_from_context(context)
+        await q.edit_message_text("✅ Зона сохранена.", reply_markup=kb_coords_main())
+        return
+
+    if data == "coords:set_out":
+        await q.edit_message_text("Выбери, как вывести результат:", reply_markup=kb_coords_pick_output())
+        return
+
+    if data.startswith("coords:out:"):
+        mode = data.split(":")[-1]
+        if mode not in ("chat", "csv"):
+            await q.edit_message_text("Не понял формат вывода.", reply_markup=kb_coords_main())
+            return
+        context.user_data["coords_out_mode"] = "Показать в чате" if mode == "chat" else "Файл CSV"
+        context.user_data["coords_out_mode_code"] = mode
+        sync_globals_from_context(context)
+        await q.edit_message_text("✅ Формат вывода сохранён.", reply_markup=kb_coords_main())
+        return
+
+    if data == "coords:ready":
+        # проверка настроек
+        src = context.user_data.get("coords_src")
+        dst = context.user_data.get("coords_dst")
+        out_mode = context.user_data.get("coords_out_mode_code")
+        if not src or not dst or not out_mode:
+            sync_globals_from_context(context)
+            await q.edit_message_text(
+                "Нужно выбрать ВСЁ: исходную СК, конечную СК и формат вывода.",
+                reply_markup=kb_coords_main()
+            )
+            return
+        context.user_data["awaiting"] = "coords_input"
+        await q.edit_message_text(
+            "✅ Готово.\n"
+            "Теперь пришли координаты:\n"
+            "- текстом\n"
+            "- фото\n"
+            "- файлом txt/csv\n\n"
+            "Формат текста: каждая строка содержит 2 числа (X Y) — я возьму первые два.",
+            reply_markup=kb_coords_ready()
+        )
+        return
+
+    if data == "coords:manual":
+        context.user_data["awaiting"] = "coords_manual"
+        await q.edit_message_text(
+            "✍️ Ввод координат вручную.\n"
+            "Пришли:\n"
+            "72853345 551668\n"
+            "или список строк, в каждой строке 2 числа.",
+            reply_markup=kb_coords_ready()
+        )
+        return
+
+    if data == "coords:photo_help":
+        context.user_data["awaiting"] = "coords_photo"
+        await q.edit_message_text(
+            "📷 Пришли фото с координатами.\n"
+            "Я распознаю X/Y и пересчитаю по выбранным СК.\n"
+            "Если где-то не уверен — поставлю '?' и попрошу перепроверить.",
+            reply_markup=kb_coords_ready()
+        )
+        return
+
+    if data == "coords:file_help":
+        context.user_data["awaiting"] = "coords_file"
+        await q.edit_message_text(
+            "📎 Пришли файл .txt или .csv.\n"
+            "Я возьму из каждой строки первые 2 числа как X и Y.\n"
+            "Разделители могут быть пробел/таб/; /, — главное, чтобы числа были.",
+            reply_markup=kb_coords_ready()
+        )
+        return
+
+    # ====== CADASTRE ======
+    if data == "cad:manual":
+        context.user_data["awaiting"] = "cad_manual"
+        await q.edit_message_text(
+            "✍️ Введи кадастровый номер (формат типа 89:35:800113:31):",
+            reply_markup=kb_land_cadnum()
+        )
+        return
+
+    if data == "cad:photo_help":
+        context.user_data["awaiting"] = "cad_photo"
+        await q.edit_message_text(
+            "📷 Пришли фото, где есть кадастровый номер.\n"
+            "Я распознаю и попробую получить сведения.",
+            reply_markup=kb_land_cadnum()
+        )
+        return
+
+    if data == "cad:file_help":
+        context.user_data["awaiting"] = "cad_file"
+        await q.edit_message_text(
+            "📎 Пришли файл .txt или .csv с кадастровыми номерами.\n"
+            "Я найду все КН в тексте и выведу сведения по каждому (по очереди).",
+            reply_markup=kb_land_cadnum()
+        )
+        return
+
+    await q.edit_message_text("Не понял команду. Нажми /menu", reply_markup=kb_root())
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mode = get_mode(context)
+    awaiting = context.user_data.get("awaiting")
     text = update.message.text or ""
 
-    awaiting = context.user_data.get("awaiting_manual_input")
+    # ---- COORDS INPUT (text) ----
+    if awaiting in ("coords_input", "coords_manual") or mode == "mine_coords":
+        # если пользователь в координатах и прислал числа — пробуем пересчитать
+        src = context.user_data.get("coords_src")
+        dst = context.user_data.get("coords_dst")
+        out_mode = context.user_data.get("coords_out_mode_code")
 
-    # --- ввод СК
-    if awaiting == "set_crs":
-        src, dst = parse_crs_pair_from_text(text)
-        if not src or not dst:
-            await update.message.reply_text(
-                "Не понял формат. Пришли так:\n"
-                "СК: EPSG:3857 -> EPSG:4326\n"
-                "или:\n"
-                "СК: WGS84 -> WebMercator"
-            )
-            return
+        if src and dst and out_mode:
+            points = parse_points_from_text(text)
+            if points:
+                await do_transform_and_respond(update, context, points)
+                return
 
-        # проверим что pyproj понимает
-        try:
-            _ = CRS.from_user_input(src)
-            _ = CRS.from_user_input(dst)
-        except Exception as e:
-            await update.message.reply_text(
-                "Не смог распознать одну из СК.\n"
-                f"Ошибка: {e}\n\n"
-                "Попробуй EPSG:4326 / EPSG:3857 или пришли точные EPSG."
-            )
-            return
-
-        set_crs_pair(context, src, dst)
-        context.user_data.pop("awaiting_manual_input", None)
-        await update.message.reply_text(
-            f"✅ СК заданы:\n{src} -> {dst}\n\nТеперь пришли координаты (текстом или фото).",
-            reply_markup=kb_mode_actions_coords()
-        )
-        return
-
-    # --- ручной ввод координат
-    if awaiting == "coords":
-        points = parse_points_from_text(text)
-        if not points:
-            await update.message.reply_text(
-                "Не смог понять координаты.\n"
-                "Пришли:\n"
-                "X=72853345 Y=551668\n"
-                "или несколько строк, в каждой 2 числа."
-            )
-            return
-
-        # сохраняем pending
-        if len(points) == 1:
-            x, y = points[0]
-            context.user_data["pending"] = {"kind": "coords", "x": x, "y": y, "points": points, "source": "manual"}
-            context.user_data.pop("awaiting_manual_input", None)
-            await update.message.reply_text(
-                f"Я понял так:\nX={x}\nY={y}\nПодтверждаешь?",
-                reply_markup=kb_confirm("coords")
-            )
-        else:
-            context.user_data["pending"] = {"kind": "coords", "points": points, "source": "manual"}
-            context.user_data.pop("awaiting_manual_input", None)
-            await update.message.reply_text(
-                f"Я понял список точек ({len(points)} шт.). Подтверждаешь?",
-                reply_markup=kb_confirm("coords")
-            )
-        return
-
-    # --- ручной ввод кадастра
-    if awaiting == "cadnum":
+    # ---- CAD INPUT (text) ----
+    if awaiting == "cad_manual" or mode == "land_cadnum":
         cadnums = parse_cadnums_from_text(text)
-        if len(cadnums) == 1:
-            cad = cadnums[0]
-            context.user_data["pending"] = {"kind": "cadnum", "cadnum": cad, "source": "manual"}
-            context.user_data.pop("awaiting_manual_input", None)
+        if not cadnums:
             await update.message.reply_text(
-                f"Я понял так:\nКН: {cad}\nПодтверждаешь?",
-                reply_markup=kb_confirm("cadnum")
+                "Не вижу корректный кадастровый номер (формат типа 89:35:800113:31). Попробуй ещё раз.",
+                reply_markup=kb_land_cadnum()
             )
-        elif len(cadnums) > 1:
-            await update.message.reply_text(
-                "Нашёл несколько КН:\n- " + "\n- ".join(cadnums) + "\n\nПришли один нужный."
-            )
-        else:
-            await update.message.reply_text(
-                "Не вижу корректный КН (формат типа 89:35:800113:31). Пришли ещё раз."
-            )
-        return
+            return
 
-    # --- фото пришло раньше без подписи
-    last_photo_b64 = context.user_data.pop("last_photo_b64", None)
-    if last_photo_b64:
-        await update.message.reply_text("Принял подпись. Анализирую фото…")
-        result_text, reply_markup = await process_photo_in_mode(context, mode, last_photo_b64, text)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return
-
-    # --- если режим не выбран
-    if mode in ("none", "mine", "land"):
-        await update.message.reply_text("Сначала выбери раздел/действие:", reply_markup=kb_root())
-        return
-
-    # --- нормативка (текстом через Claude)
-    if mode == "mine_norms":
-        await update.message.reply_text(
-            ask_claude_text(text, "Режим: маркшейдерская нормативка."),
-            reply_markup=kb_mine()
-        )
-        return
-
-    if mode == "land_norms":
-        await update.message.reply_text(
-            ask_claude_text(text, "Режим: землеустроительная нормативка."),
-            reply_markup=kb_land()
-        )
-        return
-
-    # --- кадастр текстом
-    if mode == "land_cadnum":
-        cadnums = parse_cadnums_from_text(text)
-        if len(cadnums) == 1:
-            cad = cadnums[0]
-            context.user_data["pending"] = {"kind": "cadnum", "cadnum": cad, "source": "text"}
-            await update.message.reply_text(
-                f"Я распознал КН как:\n{cad}\nПодтверждаешь?",
-                reply_markup=kb_confirm("cadnum")
-            )
-        else:
-            await update.message.reply_text(
-                "Не вижу корректный КН.\n"
-                "Ожидаемый формат: 89:35:800113:31\n"
-                "Можно нажать «✍️ Ввести КН вручную» или прислать фото.",
-                reply_markup=kb_mode_actions_cadnum()
-            )
-        return
-
-    # --- координаты текстом: если СК заданы — сразу пересчитываем
-    if mode == "mine_coords":
-        # 1) если человек прислал строку СК: ...
-        src, dst = parse_crs_pair_from_text(text)
-        if src and dst:
+        # если несколько — обработаем по одному
+        for cad in cadnums:
+            await update.message.reply_text(f"Запрашиваю сведения по КН: {cad} …")
             try:
-                _ = CRS.from_user_input(src)
-                _ = CRS.from_user_input(dst)
-                set_crs_pair(context, src, dst)
-                await update.message.reply_text(
-                    f"✅ СК заданы:\n{src} -> {dst}\n\nТеперь пришли координаты.",
-                    reply_markup=kb_mode_actions_coords()
-                )
+                data_json = await fetch_nspd_info(cad)
+                info = summarize_nspd_json(cad, data_json)
+                await update.message.reply_text(info, reply_markup=kb_land_cadnum())
             except Exception as e:
+                logger.exception("NSPD fetch failed")
                 await update.message.reply_text(
-                    f"Не смог распознать СК.\nОшибка: {e}",
-                    reply_markup=kb_mode_actions_coords()
+                    "Не смог получить сведения (НСПД может быть недоступен/ограничивает запросы).\n"
+                    f"Ошибка: {e}",
+                    reply_markup=kb_land_cadnum()
                 )
-            return
-
-        points = parse_points_from_text(text)
-        if not points:
-            await update.message.reply_text(
-                "Не смог понять координаты.\n"
-                "Либо пришли фото, либо нажми «✍️ Ввести координаты вручную».",
-                reply_markup=kb_mode_actions_coords()
-            )
-            return
-
-        src_crs, dst_crs = get_crs_pair(context)
-        if not src_crs or not dst_crs:
-            # сохраним как pending, но сначала попросим СК
-            context.user_data["pending"] = {"kind": "coords", "points": points, "source": "text"}
-            await update.message.reply_text(
-                "Координаты принял, но СК не заданы.\n"
-                "Задай СК (кнопка «⚙️ Задать СК») или пришли строкой:\n"
-                "СК: EPSG:3857 -> EPSG:4326",
-                reply_markup=kb_mode_actions_coords()
-            )
-            return
-
-        # преобразование
-        try:
-            tr = build_transformer(src_crs, dst_crs)
-            out_points: List[Tuple[float, float]] = []
-            for x, y in points:
-                xx, yy = tr.transform(x, y)
-                out_points.append((xx, yy))
-
-            await update.message.reply_text(
-                "✅ Результат пересчёта:\n\n" + format_points_table(out_points),
-                reply_markup=kb_mode_actions_coords()
-            )
-        except Exception as e:
-            logger.exception("Transform error")
-            await update.message.reply_text(
-                "Не смог пересчитать. Возможные причины:\n"
-                "- неверно задана СК\n"
-                "- СК не совместимы\n"
-                "- порядок координат не тот (lon/lat vs x/y)\n\n"
-                f"Ошибка: {e}",
-                reply_markup=kb_mode_actions_coords()
-            )
         return
 
-    # --- заглушка отчётов
-    if mode == "mine_report":
-        await update.message.reply_text(
-            "Принял. Генератор отчётов ещё не подключён.\n"
-            "Следующий шаг: подключим шаблоны и генерацию файлов.\n\n"
-            f"Твой ввод:\n{text}",
-            reply_markup=kb_mine()
-        )
-        return
-
-    await update.message.reply_text("Не понял режим. Нажми /menu", reply_markup=kb_root())
+    await update.message.reply_text("Открой /menu и выбери действие.", reply_markup=kb_root())
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mode = get_mode(context)
-    caption = (update.message.caption or "").strip()
+    awaiting = context.user_data.get("awaiting")
 
     photo = update.message.photo[-1]
     f = await photo.get_file()
     b = await f.download_as_bytearray()
     image_b64 = base64.b64encode(bytes(b)).decode("utf-8")
 
-    if caption:
-        await update.message.reply_text("Фото с подписью получено. Анализирую…")
-        result_text, reply_markup = await process_photo_in_mode(context, mode, image_b64, caption)
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return
+    # ---- COORDS PHOTO ----
+    if awaiting == "coords_photo" or (mode == "mine_coords" and context.user_data.get("coords_src")):
+        await update.message.reply_text("Распознаю координаты с фото…")
 
-    if mode in ("mine_coords", "land_cadnum"):
-        await update.message.reply_text("Фото получил. Пробую распознать…")
-        result_text, reply_markup = await process_photo_in_mode(context, mode, image_b64, "")
-        await update.message.reply_text(result_text, reply_markup=reply_markup)
-        return
-
-    context.user_data["last_photo_b64"] = image_b64
-    await update.message.reply_text(
-        "Фото получил. Напиши одним сообщением, что нужно извлечь/сделать по этому фото.\n"
-        "Или выбери режим через /menu."
-    )
-
-
-async def process_photo_in_mode(
-    context: ContextTypes.DEFAULT_TYPE,
-    mode: str,
-    image_b64: str,
-    caption: str,
-) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
-    cap_low = (caption or "").lower()
-
-    # ====== Координаты (распознаём -> просим подтвердить) ======
-    if mode == "mine_coords" or ("коорд" in cap_low) or ("x=" in cap_low) or ("y=" in cap_low):
         system_add = (
-            "Задача: распознать координаты X и Y с изображения.\n"
-            "КРИТИЧНО:\n"
-            "- Не выдумывай и не 'додумывай' цифры.\n"
-            "- Если цифра/символ плохо видна — поставь знак '?' на её месте.\n"
-            "- Верни ровно в формате:\n"
-            "TRANSCRIPTION:\n"
-            "<перепиши как на бумаге, строка в строку>\n"
-            "PARSED:\n"
-            "X=<значение>\n"
-            "Y=<значение>\n"
-        )
-        raw = ask_claude_with_image(caption.strip() or "Распознай X и Y.", image_b64, system_add=system_add)
-
-        mx = re.search(r"\bX\s*=\s*([0-9?,.\-+]+)", raw, re.IGNORECASE)
-        my = re.search(r"\bY\s*=\s*([0-9?,.\-+]+)", raw, re.IGNORECASE)
-        x_s = mx.group(1).strip() if mx else ""
-        y_s = my.group(1).strip() if my else ""
-
-        x_val = _clean_num(x_s) if x_s and "?" not in x_s else None
-        y_val = _clean_num(y_s) if y_s and "?" not in y_s else None
-
-        context.user_data["pending"] = {
-            "kind": "coords",
-            "x": x_val,
-            "y": y_val,
-            "points": [(x_val, y_val)] if x_val is not None and y_val is not None else [],
-            "raw": raw,
-            "source": "photo",
-        }
-
-        msg = (
-            "Я распознал координаты так (проверь внимательно):\n\n"
-            f"{raw}\n\n"
-            "✅ Подтвердить / ✏️ Исправить вручную"
-        )
-        return msg, kb_confirm("coords")
-
-    # ====== Кадастровый номер (распознаём -> просим подтвердить) ======
-    if mode == "land_cadnum" or ("кадастр" in cap_low) or ("кн" in cap_low):
-        system_add = (
-            "Задача: распознать кадастровый номер РФ на изображении.\n"
-            "КРИТИЧНО:\n"
-            "- Не выдумывай и не исправляй номер.\n"
-            "- Если не уверен в цифре — поставь '?' на её месте.\n"
-            "- Верни в формате:\n"
+            "Распознай координаты X и Y.\n"
+            "Верни строго:\n"
             "TRANSCRIPTION:\n"
             "<как написано>\n"
             "PARSED:\n"
-            "CADNUM=<как распознал>\n"
+            "X=<значение или ?>\n"
+            "Y=<значение или ?>\n"
         )
-        raw = ask_claude_with_image(caption.strip() or "Распознай кадастровый номер.", image_b64, system_add=system_add)
+
+        try:
+            raw = ask_claude_with_image("Распознай X и Y.", image_b64, system_add)
+        except Exception as e:
+            logger.exception("Claude photo error")
+            await update.message.reply_text(f"Ошибка распознавания фото: {e}", reply_markup=kb_coords_ready())
+            return
+
+        mx = re.search(r"\bX\s*=\s*([0-9?,.\-+]+)", raw, re.IGNORECASE)
+        my = re.search(r"\bY\s*=\s*([0-9?,.\-+]+)", raw, re.IGNORECASE)
+        x_s = (mx.group(1).strip() if mx else "")
+        y_s = (my.group(1).strip() if my else "")
+
+        if not x_s or not y_s or "?" in x_s or "?" in y_s:
+            await update.message.reply_text(
+                "Не уверен в распознавании.\n\n"
+                f"{raw}\n\n"
+                "Скопируй и пришли координаты вручную (правильно), либо пришли более чёткое фото.",
+                reply_markup=kb_coords_ready()
+            )
+            return
+
+        x = _clean_num(x_s)
+        y = _clean_num(y_s)
+        if x is None or y is None:
+            await update.message.reply_text(
+                "Не смог преобразовать распознанные числа.\n\n"
+                f"{raw}\n\n"
+                "Пришли координаты вручную.",
+                reply_markup=kb_coords_ready()
+            )
+            return
+
+        await do_transform_and_respond(update, context, [(x, y)])
+        return
+
+    # ---- CAD PHOTO ----
+    if awaiting == "cad_photo" or mode == "land_cadnum":
+        await update.message.reply_text("Распознаю кадастровый номер с фото…")
+
+        system_add = (
+            "Распознай кадастровый номер РФ.\n"
+            "Не выдумывай.\n"
+            "Верни:\n"
+            "TRANSCRIPTION:\n"
+            "<как написано>\n"
+            "PARSED:\n"
+            "CADNUM=<как распознал или ?>\n"
+        )
+        try:
+            raw = ask_claude_with_image("Распознай кадастровый номер.", image_b64, system_add)
+        except Exception as e:
+            logger.exception("Claude photo error")
+            await update.message.reply_text(f"Ошибка распознавания фото: {e}", reply_markup=kb_land_cadnum())
+            return
+
         mc = re.search(r"\bCADNUM\s*=\s*([0-9?:]+)", raw, re.IGNORECASE)
-        cad_guess = mc.group(1).strip() if mc else ""
+        cad_guess = (mc.group(1).strip() if mc else "")
+        if not cad_guess or "?" in cad_guess:
+            await update.message.reply_text(
+                "Не уверен в распознавании КН.\n\n"
+                f"{raw}\n\n"
+                "Пришли КН вручную (точно) или более чёткое фото.",
+                reply_markup=kb_land_cadnum()
+            )
+            return
 
-        cad = None
-        cadnums = parse_cadnums_from_text(cad_guess) if cad_guess and "?" not in cad_guess else []
-        if len(cadnums) == 1:
-            cad = cadnums[0]
+        cadnums = parse_cadnums_from_text(cad_guess)
+        if len(cadnums) != 1:
+            await update.message.reply_text(
+                "Не могу уверенно выделить корректный КН.\n\n"
+                f"{raw}\n\n"
+                "Пришли КН вручную.",
+                reply_markup=kb_land_cadnum()
+            )
+            return
 
-        context.user_data["pending"] = {"kind": "cadnum", "cadnum": cad, "raw": raw, "source": "photo"}
-        msg = (
-            "Я распознал КН так (проверь внимательно):\n\n"
-            f"{raw}\n\n"
-            "✅ Подтвердить / ✏️ Исправить вручную"
+        cad = cadnums[0]
+        await update.message.reply_text(f"Распознал как: {cad}. Запрашиваю сведения…")
+        try:
+            data_json = await fetch_nspd_info(cad)
+            info = summarize_nspd_json(cad, data_json)
+            await update.message.reply_text(info, reply_markup=kb_land_cadnum())
+        except Exception as e:
+            logger.exception("NSPD fetch failed")
+            await update.message.reply_text(
+                "Не смог получить сведения (НСПД может быть недоступен/ограничивает запросы).\n"
+                f"Ошибка: {e}",
+                reply_markup=kb_land_cadnum()
+            )
+        return
+
+    await update.message.reply_text("Открой /menu и выбери действие.", reply_markup=kb_root())
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    mode = get_mode(context)
+    awaiting = context.user_data.get("awaiting")
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    filename = (doc.file_name or "").lower()
+    if not (filename.endswith(".txt") or filename.endswith(".csv")):
+        await update.message.reply_text(
+            "Поддерживаю пока только .txt и .csv.\n"
+            "Сохрани как txt/csv и пришли снова.",
         )
-        return msg, kb_confirm("cadnum")
+        return
 
-    return ("Не понял, что извлекать с фото. Открой /menu и выбери режим.", kb_root())
+    file = await doc.get_file()
+    b = await file.download_as_bytearray()
+    text = None
+    try:
+        text = bytes(b).decode("utf-8")
+    except Exception:
+        try:
+            text = bytes(b).decode("cp1251", errors="ignore")
+        except Exception:
+            text = bytes(b).decode("utf-8", errors="ignore")
+
+    # ---- COORDS FILE ----
+    if awaiting == "coords_file" or (mode == "mine_coords" and context.user_data.get("coords_src")):
+        src = context.user_data.get("coords_src")
+        dst = context.user_data.get("coords_dst")
+        out_mode = context.user_data.get("coords_out_mode_code")
+
+        if not (src and dst and out_mode):
+            await update.message.reply_text(
+                "Сначала настрой исходную/конечную СК и формат вывода.\n"
+                "Открой: Маркшейдерия → Пересчёт координат.",
+                reply_markup=kb_mine()
+            )
+            return
+
+        points = parse_points_from_text(text)
+        if not points:
+            await update.message.reply_text(
+                "В файле не нашёл координаты. Нужно, чтобы в строках были числа (X Y).",
+                reply_markup=kb_coords_ready()
+            )
+            return
+
+        await do_transform_and_respond(update, context, points, filename_hint=os.path.splitext(filename)[0])
+        return
+
+    # ---- CAD FILE ----
+    if awaiting == "cad_file" or mode == "land_cadnum":
+        cadnums = parse_cadnums_from_text(text)
+        if not cadnums:
+            await update.message.reply_text(
+                "В файле не нашёл кадастровых номеров (формат 89:35:800113:31).",
+                reply_markup=kb_land_cadnum()
+            )
+            return
+
+        await update.message.reply_text(f"Нашёл КН: {len(cadnums)} шт. Начинаю запрос…")
+        for cad in cadnums:
+            await update.message.reply_text(f"КН: {cad} …")
+            try:
+                data_json = await fetch_nspd_info(cad)
+                info = summarize_nspd_json(cad, data_json)
+                await update.message.reply_text(info)
+            except Exception as e:
+                logger.exception("NSPD fetch failed")
+                await update.message.reply_text(f"Ошибка запроса по {cad}: {e}")
+        await update.message.reply_text("Готово.", reply_markup=kb_land_cadnum())
+        return
+
+    await update.message.reply_text("Открой /menu и выбери действие.", reply_markup=kb_root())
+
+
+async def do_transform_and_respond(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    points: List[Tuple[float, float]],
+    filename_hint: str = "coords",
+) -> None:
+    src = context.user_data.get("coords_src")
+    dst = context.user_data.get("coords_dst")
+    out_mode = context.user_data.get("coords_out_mode_code")
+
+    if not (src and dst and out_mode):
+        await update.message.reply_text(
+            "Не заданы СК/вывод. Открой: Маркшейдерия → Пересчёт координат.",
+            reply_markup=kb_mine()
+        )
+        return
+
+    try:
+        out_points = transform_points(points, src, dst)
+    except Exception as e:
+        logger.exception("Transform error")
+        await update.message.reply_text(
+            "Не смог пересчитать. Частая причина — неправильно выбрана зона СК-42.\n"
+            f"Ошибка: {e}",
+            reply_markup=kb_coords_ready()
+        )
+        return
+
+    if out_mode == "chat":
+        await update.message.reply_text(
+            "✅ Результат:\n\n" + format_points_table(out_points),
+            reply_markup=kb_coords_ready()
+        )
+        return
+
+    # csv
+    csv_bytes = make_csv_bytes(out_points)
+    bio = BytesIO(csv_bytes)
+    bio.name = f"{filename_hint}_converted.csv"
+    bio.seek(0)
+
+    await update.message.reply_document(
+        document=InputFile(bio),
+        filename=bio.name,
+        caption="✅ Готово. Результат в CSV (разделитель ';').",
+        reply_markup=kb_coords_ready()
+    )
 
 
 # ================== ERROR HANDLER ==================
@@ -933,7 +1008,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.exception("Unhandled error", exc_info=context.error)
     try:
         if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("Произошёл сетевой/временный сбой. Повтори действие.")
+            await update.effective_message.reply_text("Произошёл временный сбой. Повтори действие.")
     except Exception:
         pass
 
@@ -948,6 +1023,7 @@ def main() -> None:
 
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_error_handler(error_handler)
