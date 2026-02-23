@@ -73,11 +73,24 @@ CADNUM_RE = re.compile(r"\b\d{2}:\d{2}:\d{6,7}:\d+\b")
 NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
 
-# ================== CRS PRESETS ==================
-CRS_PRESETS = {
-    "WGS84 (географические)": {"kind": "epsg", "code": "EPSG:4326"},
-    "WebMercator (EPSG:3857)": {"kind": "epsg", "code": "EPSG:3857"},
-    "СК-42 (Гаусс-Крюгер, выбрать зону)": {"kind": "sk42_zone"},
+# ================== CRS OPTIONS (SHORT IDs to avoid callback_data limit) ==================
+# IMPORTANT: callback_data must be <= 64 bytes. Use short ASCII ids ONLY.
+CRS_OPTIONS: Dict[str, Dict[str, str]] = {
+    "wgs84": {
+        "label": "WGS84 (географические)",
+        "kind": "epsg",
+        "code": "EPSG:4326",
+    },
+    "webmerc": {
+        "label": "WebMercator (EPSG:3857)",
+        "kind": "epsg",
+        "code": "EPSG:3857",
+    },
+    "sk42gk": {
+        "label": "СК-42 (Гаусс-Крюгер, выбрать зону)",
+        "kind": "sk42_zone",
+        "code": "",
+    },
 }
 
 OUTPUT_PRESETS = {
@@ -151,9 +164,12 @@ def kb_coords_main() -> InlineKeyboardMarkup:
 
 
 def kb_coords_pick_crs(kind: str) -> InlineKeyboardMarkup:
+    # kind: "src" or "dst"
     rows: List[List[InlineKeyboardButton]] = []
-    for label in CRS_PRESETS.keys():
-        rows.append([InlineKeyboardButton(label, callback_data=f"coords:pick_{kind}:{label}")])
+    for crs_id, meta in CRS_OPTIONS.items():
+        label = meta["label"]
+        # short callback_data:
+        rows.append([InlineKeyboardButton(label, callback_data=f"coords:pick:{kind}:{crs_id}")])
     rows += kb_nav(back_to="coords:home", include_menu=True)
     return InlineKeyboardMarkup(rows)
 
@@ -167,7 +183,7 @@ def kb_coords_pick_zone(kind: str) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
     for z in range(start, end + 1):
-        row.append(InlineKeyboardButton(str(z), callback_data=f"coords:zone_{kind}:{z}"))
+        row.append(InlineKeyboardButton(str(z), callback_data=f"coords:zone:{kind}:{z}"))
         if len(row) == 6:
             rows.append(row)
             row = []
@@ -223,14 +239,9 @@ async def safe_answer(q) -> None:
 
 
 async def safe_edit(q, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
-    """
-    Частая причина падений: BadRequest при edit_message_text.
-    Вместо падения — отправляем новое сообщение.
-    """
     try:
         await q.edit_message_text(text, reply_markup=reply_markup)
     except BadRequest as e:
-        # типичный кейс: "Message is not modified", "Query is too old" и т.п.
         logger.warning(f"edit_message_text BadRequest: {e}")
         try:
             await q.message.reply_text(text, reply_markup=reply_markup)
@@ -257,7 +268,6 @@ def reset_coords_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("coords_zone_page", None)
     context.user_data.pop("awaiting_zone_kind", None)
     context.user_data.pop("awaiting", None)
-    context.user_data.pop("last_photo_b64", None)
 
 
 def sync_globals_from_context(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -557,19 +567,27 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_edit(q, "Выбери КОНЕЧНУЮ систему координат:", reply_markup=kb_coords_pick_crs("dst"))
         return
 
-    if data.startswith("coords:pick_src:") or data.startswith("coords:pick_dst:"):
-        _, pick, rest = data.split(":", 2)  # coords:pick_src:<label>
-        kind = "src" if pick == "pick_src" else "dst"
-        label = rest
-
-        preset = CRS_PRESETS.get(label)
-        if not preset:
+    # NEW: coords:pick:<kind>:<crs_id>
+    if data.startswith("coords:pick:"):
+        # coords:pick:src:wgs84
+        parts = data.split(":")
+        if len(parts) != 4:
             sync_globals_from_context(context)
-            await safe_edit(q, "Не понял выбор. Открой настройки заново.", reply_markup=kb_coords_main())
+            await safe_edit(q, "Не понял выбор.", reply_markup=kb_coords_main())
             return
 
-        if preset["kind"] == "epsg":
-            code = preset["code"]
+        kind = parts[2]  # src/dst
+        crs_id = parts[3]
+
+        meta = CRS_OPTIONS.get(crs_id)
+        if not meta:
+            sync_globals_from_context(context)
+            await safe_edit(q, "Не понял выбор.", reply_markup=kb_coords_main())
+            return
+
+        if meta["kind"] == "epsg":
+            code = meta["code"]
+            label = meta["label"]
             if kind == "src":
                 context.user_data["coords_src"] = code
                 context.user_data["coords_src_label"] = label
@@ -580,9 +598,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await safe_edit(q, "✅ Сохранено.", reply_markup=kb_coords_main())
             return
 
-        if preset["kind"] == "sk42_zone":
+        if meta["kind"] == "sk42_zone":
             context.user_data["coords_zone_page"] = "1"
-            context.user_data["awaiting_zone_kind"] = kind  # <-- ВАЖНО: фикс
+            context.user_data["awaiting_zone_kind"] = kind
             sync_globals_from_context(context)
             await safe_edit(
                 q,
@@ -603,10 +621,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    if data.startswith("coords:zone_src:") or data.startswith("coords:zone_dst:"):
+    # NEW: coords:zone:<kind>:<z>
+    if data.startswith("coords:zone:"):
         parts = data.split(":")
-        kind = "src" if parts[1] == "zone_src" else "dst"
-        z = int(parts[2])
+        if len(parts) != 4:
+            sync_globals_from_context(context)
+            await safe_edit(q, "Не понял выбор зоны.", reply_markup=kb_coords_main())
+            return
+
+        kind = parts[2]  # src/dst
+        z = int(parts[3])
 
         if z < 1 or z > 60:
             sync_globals_from_context(context)
@@ -649,11 +673,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         out_mode = context.user_data.get("coords_out_mode_code")
         if not src or not dst or not out_mode:
             sync_globals_from_context(context)
-            await safe_edit(
-                q,
-                "Нужно выбрать ВСЁ: исходную СК, конечную СК и формат вывода.",
-                reply_markup=kb_coords_main()
-            )
+            await safe_edit(q, "Нужно выбрать ВСЁ: исходную СК, конечную СК и формат вывода.", reply_markup=kb_coords_main())
             return
         context.user_data["awaiting"] = "coords_input"
         await safe_edit(
@@ -670,34 +690,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == "coords:manual":
         context.user_data["awaiting"] = "coords_manual"
-        await safe_edit(
-            q,
-            "✍️ Ввод координат вручную.\n"
-            "Пришли:\n"
-            "72853345 551668\n"
-            "или список строк, в каждой строке 2 числа.",
-            reply_markup=kb_coords_ready()
-        )
+        await safe_edit(q, "✍️ Пришли координаты (каждая строка 2 числа X Y).", reply_markup=kb_coords_ready())
         return
 
     if data == "coords:photo_help":
         context.user_data["awaiting"] = "coords_photo"
-        await safe_edit(
-            q,
-            "📷 Пришли фото с координатами.\n"
-            "Если где-то не уверен — поставлю '?' и попрошу перепроверить.",
-            reply_markup=kb_coords_ready()
-        )
+        await safe_edit(q, "📷 Пришли фото с координатами. Если не уверен — поставлю '?'.", reply_markup=kb_coords_ready())
         return
 
     if data == "coords:file_help":
         context.user_data["awaiting"] = "coords_file"
-        await safe_edit(
-            q,
-            "📎 Пришли файл .txt или .csv.\n"
-            "Из каждой строки возьму первые 2 числа как X и Y.",
-            reply_markup=kb_coords_ready()
-        )
+        await safe_edit(q, "📎 Пришли файл .txt или .csv. В каждой строке должны быть числа (X Y).", reply_markup=kb_coords_ready())
         return
 
     # ====== CADASTRE ======
@@ -739,10 +742,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if awaiting == "cad_manual" or mode == "land_cadnum":
         cadnums = parse_cadnums_from_text(text)
         if not cadnums:
-            await update.message.reply_text(
-                "Не вижу корректный кадастровый номер (типа 89:35:800113:31).",
-                reply_markup=kb_land_cadnum()
-            )
+            await update.message.reply_text("Не вижу корректный кадастровый номер (типа 89:35:800113:31).", reply_markup=kb_land_cadnum())
             return
 
         for cad in cadnums:
@@ -784,7 +784,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "X=<значение или ?>\n"
             "Y=<значение или ?>\n"
         )
-
         try:
             raw = ask_claude_with_image("Распознай X и Y.", image_b64, system_add)
         except Exception as e:
