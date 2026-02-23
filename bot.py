@@ -4,7 +4,6 @@ import csv
 import base64
 import logging
 from io import BytesIO, StringIO
-from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
 
 import httpx
@@ -23,6 +22,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import BadRequest
 
 from anthropic import Anthropic
 from pyproj import CRS, Transformer
@@ -74,13 +74,6 @@ NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
 
 # ================== CRS PRESETS ==================
-# Важно:
-# - WGS84 географические: EPSG:4326 (lon, lat)
-# - WebMercator: EPSG:3857
-# - СК-42 (Пулково 1942) Гаусс-Крюгер зоны: EPSG:28401..28460 (зона 1..60)
-#
-# Замечание: "СК-42 прямоугольные" = как правило GK в нужной зоне.
-#
 CRS_PRESETS = {
     "WGS84 (географические)": {"kind": "epsg", "code": "EPSG:4326"},
     "WebMercator (EPSG:3857)": {"kind": "epsg", "code": "EPSG:3857"},
@@ -91,6 +84,18 @@ OUTPUT_PRESETS = {
     "Показать в чате": "chat",
     "Сгенерировать файл (CSV)": "csv",
 }
+
+
+# ================== UI GLOBALS (for keyboard labels) ==================
+_GLOBAL_CTX: Dict[str, Any] = {}
+
+
+def _set(context_key: str, value: Any) -> None:
+    _GLOBAL_CTX[context_key] = value
+
+
+def _get(context_key: str, default: Any = None) -> Any:
+    return _GLOBAL_CTX.get(context_key, default)
 
 
 # ================== UI HELPERS ==================
@@ -131,10 +136,9 @@ def kb_land() -> InlineKeyboardMarkup:
 
 
 def kb_coords_main() -> InlineKeyboardMarkup:
-    # Мастер-меню координат
-    src = _get(context_key="coords_src_label", default="не выбрана")
-    dst = _get(context_key="coords_dst_label", default="не выбрана")
-    out = _get(context_key="coords_out_mode", default="не выбран")
+    src = _get("coords_src_label", "не выбрана")
+    dst = _get("coords_dst_label", "не выбрана")
+    out = _get("coords_out_mode", "не выбран")
 
     rows = [
         [InlineKeyboardButton(f"1) Исходная СК: {src}", callback_data="coords:set_src")],
@@ -147,7 +151,6 @@ def kb_coords_main() -> InlineKeyboardMarkup:
 
 
 def kb_coords_pick_crs(kind: str) -> InlineKeyboardMarkup:
-    # kind = "src" or "dst"
     rows: List[List[InlineKeyboardButton]] = []
     for label in CRS_PRESETS.keys():
         rows.append([InlineKeyboardButton(label, callback_data=f"coords:pick_{kind}:{label}")])
@@ -156,8 +159,6 @@ def kb_coords_pick_crs(kind: str) -> InlineKeyboardMarkup:
 
 
 def kb_coords_pick_zone(kind: str) -> InlineKeyboardMarkup:
-    # Показываем зоны 1..30 и 31..60 переключалками
-    # Чтобы не городить пагинацию - две страницы
     page = _get("coords_zone_page", "1")
     page = page if page in ("1", "2") else "1"
     start = 1 if page == "1" else 31
@@ -213,17 +214,28 @@ def kb_coords_ready() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-# ================== small context helper ==================
-# (чтобы kb_coords_main мог брать значения даже когда context не передан)
-_GLOBAL_CTX: Dict[str, Any] = {}
+# ================== SAFE EDIT / SAFE ANSWER ==================
+async def safe_answer(q) -> None:
+    try:
+        await q.answer()
+    except Exception:
+        pass
 
 
-def _set(context_key: str, value: Any) -> None:
-    _GLOBAL_CTX[context_key] = value
-
-
-def _get(context_key: str, default: Any = None) -> Any:
-    return _GLOBAL_CTX.get(context_key, default)
+async def safe_edit(q, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
+    """
+    Частая причина падений: BadRequest при edit_message_text.
+    Вместо падения — отправляем новое сообщение.
+    """
+    try:
+        await q.edit_message_text(text, reply_markup=reply_markup)
+    except BadRequest as e:
+        # типичный кейс: "Message is not modified", "Query is too old" и т.п.
+        logger.warning(f"edit_message_text BadRequest: {e}")
+        try:
+            await q.message.reply_text(text, reply_markup=reply_markup)
+        except Exception as e2:
+            logger.warning(f"fallback reply_text failed: {e2}")
 
 
 # ================== STATE ==================
@@ -241,13 +253,14 @@ def reset_coords_wizard(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("coords_src_label", None)
     context.user_data.pop("coords_dst_label", None)
     context.user_data.pop("coords_out_mode", None)
+    context.user_data.pop("coords_out_mode_code", None)
     context.user_data.pop("coords_zone_page", None)
+    context.user_data.pop("awaiting_zone_kind", None)
     context.user_data.pop("awaiting", None)
     context.user_data.pop("last_photo_b64", None)
 
 
 def sync_globals_from_context(context: ContextTypes.DEFAULT_TYPE) -> None:
-    # чтобы kb_coords_main мог показать значения
     _set("coords_src_label", context.user_data.get("coords_src_label", "не выбрана"))
     _set("coords_dst_label", context.user_data.get("coords_dst_label", "не выбрана"))
     _set("coords_out_mode", context.user_data.get("coords_out_mode", "не выбран"))
@@ -285,7 +298,7 @@ def ask_claude_with_image(prompt_text: str, image_b64: str, system_add: str) -> 
     return ("\n".join(out)).strip()
 
 
-# ================== COORD PARSING ==================
+# ================== COORD PARSING / TRANSFORM ==================
 def _clean_num(s: str) -> Optional[float]:
     try:
         return float(s.replace(",", "."))
@@ -302,7 +315,7 @@ def parse_points_from_text(text: str) -> List[Tuple[float, float]]:
             y = _clean_num(nums[1])
             if x is not None and y is not None:
                 pts.append((x, y))
-    # если одной строкой через пробел
+
     if not pts:
         nums = NUM_RE.findall(text or "")
         if len(nums) >= 2:
@@ -439,46 +452,43 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception:
-        pass
-
+    await safe_answer(q)
     data = q.data or ""
 
     # global nav
     if data == "nav:root":
         reset_coords_wizard(context)
         set_mode(context, "none")
-        await q.edit_message_text("Выбери раздел:", reply_markup=kb_root())
+        await safe_edit(q, "Выбери раздел:", reply_markup=kb_root())
         return
 
     if data == "nav:mine":
         set_mode(context, "mine")
-        await q.edit_message_text("Маркшейдерия:", reply_markup=kb_mine())
+        await safe_edit(q, "Маркшейдерия:", reply_markup=kb_mine())
         return
 
     if data == "nav:land":
         set_mode(context, "land")
-        await q.edit_message_text("Землеустройство:", reply_markup=kb_land())
+        await safe_edit(q, "Землеустройство:", reply_markup=kb_land())
         return
 
     # root sections
     if data == "root:mine":
         set_mode(context, "mine")
-        await q.edit_message_text("Маркшейдерия:", reply_markup=kb_mine())
+        await safe_edit(q, "Маркшейдерия:", reply_markup=kb_mine())
         return
 
     if data == "root:land":
         set_mode(context, "land")
-        await q.edit_message_text("Землеустройство:", reply_markup=kb_land())
+        await safe_edit(q, "Землеустройство:", reply_markup=kb_land())
         return
 
     # mine menu
     if data == "mine:coords":
         set_mode(context, "mine_coords")
         sync_globals_from_context(context)
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "📐 Пересчёт координат — настройки.\n"
             "Сначала выбери исходную/конечную СК и формат вывода.",
             reply_markup=kb_coords_main()
@@ -487,7 +497,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == "mine:norms":
         set_mode(context, "mine_norms")
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "📚 Нормативная документация (маркшейдерия).\n"
             "Пока заглушка (следующим шагом подключим поиск по НД).",
             reply_markup=kb_mine()
@@ -496,7 +507,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == "mine:report":
         set_mode(context, "mine_report")
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "🧾 Составление отчёта.\n"
             "Пока заглушка (следующим шагом подключим шаблоны/генерацию).",
             reply_markup=kb_mine()
@@ -507,7 +519,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if data == "land:cadnum":
         set_mode(context, "land_cadnum")
         context.user_data["awaiting"] = None
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "🏷️ Кадастровый номер.\n"
             "Можно ввести вручную / прислать фото / прислать файл.",
             reply_markup=kb_land_cadnum()
@@ -516,7 +529,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == "land:norms":
         set_mode(context, "land_norms")
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "📚 Нормативная документация (землеустройство).\n"
             "Пока заглушка (позже добавим НД и поиск).",
             reply_markup=kb_land()
@@ -527,7 +541,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if data == "coords:home":
         set_mode(context, "mine_coords")
         sync_globals_from_context(context)
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "📐 Пересчёт координат — настройки.\n"
             "Выбери исходную/конечную СК и формат вывода.",
             reply_markup=kb_coords_main()
@@ -535,11 +550,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if data == "coords:set_src":
-        await q.edit_message_text("Выбери ИСХОДНУЮ систему координат:", reply_markup=kb_coords_pick_crs("src"))
+        await safe_edit(q, "Выбери ИСХОДНУЮ систему координат:", reply_markup=kb_coords_pick_crs("src"))
         return
 
     if data == "coords:set_dst":
-        await q.edit_message_text("Выбери КОНЕЧНУЮ систему координат:", reply_markup=kb_coords_pick_crs("dst"))
+        await safe_edit(q, "Выбери КОНЕЧНУЮ систему координат:", reply_markup=kb_coords_pick_crs("dst"))
         return
 
     if data.startswith("coords:pick_src:") or data.startswith("coords:pick_dst:"):
@@ -549,7 +564,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         preset = CRS_PRESETS.get(label)
         if not preset:
-            await q.edit_message_text("Не понял выбор. Открой настройки заново.", reply_markup=kb_coords_main())
+            sync_globals_from_context(context)
+            await safe_edit(q, "Не понял выбор. Открой настройки заново.", reply_markup=kb_coords_main())
             return
 
         if preset["kind"] == "epsg":
@@ -561,14 +577,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 context.user_data["coords_dst"] = code
                 context.user_data["coords_dst_label"] = label
             sync_globals_from_context(context)
-            await q.edit_message_text("✅ Сохранено.", reply_markup=kb_coords_main())
+            await safe_edit(q, "✅ Сохранено.", reply_markup=kb_coords_main())
             return
 
         if preset["kind"] == "sk42_zone":
-            # нужно выбрать зону
             context.user_data["coords_zone_page"] = "1"
+            context.user_data["awaiting_zone_kind"] = kind  # <-- ВАЖНО: фикс
             sync_globals_from_context(context)
-            await q.edit_message_text(
+            await safe_edit(
+                q,
                 f"Выбери зону СК-42 (Гаусс-Крюгер) для {'ИСХОДНОЙ' if kind=='src' else 'КОНЕЧНОЙ'} СК:",
                 reply_markup=kb_coords_pick_zone(kind)
             )
@@ -578,23 +595,22 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         page = data.split(":")[-1]
         context.user_data["coords_zone_page"] = page if page in ("1", "2") else "1"
         sync_globals_from_context(context)
-        # определить, для чего открыта зона? храним временно:
-        # проще: если есть флаг awaiting_zone_kind
         kind = context.user_data.get("awaiting_zone_kind", "src")
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             f"Выбери зону СК-42 (Гаусс-Крюгер) для {'ИСХОДНОЙ' if kind=='src' else 'КОНЕЧНОЙ'} СК:",
             reply_markup=kb_coords_pick_zone(kind)
         )
         return
 
     if data.startswith("coords:zone_src:") or data.startswith("coords:zone_dst:"):
-        # coords:zone_src:7
         parts = data.split(":")
         kind = "src" if parts[1] == "zone_src" else "dst"
         z = int(parts[2])
 
         if z < 1 or z > 60:
-            await q.edit_message_text("Зона должна быть 1..60", reply_markup=kb_coords_main())
+            sync_globals_from_context(context)
+            await safe_edit(q, "Зона должна быть 1..60", reply_markup=kb_coords_main())
             return
 
         epsg = f"EPSG:{28400 + z}"
@@ -607,53 +623,55 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.user_data["coords_dst"] = epsg
             context.user_data["coords_dst_label"] = label
 
-        context.user_data.pop("awaiting_zone_kind", None)
         sync_globals_from_context(context)
-        await q.edit_message_text("✅ Зона сохранена.", reply_markup=kb_coords_main())
+        await safe_edit(q, "✅ Зона сохранена.", reply_markup=kb_coords_main())
         return
 
     if data == "coords:set_out":
-        await q.edit_message_text("Выбери, как вывести результат:", reply_markup=kb_coords_pick_output())
+        await safe_edit(q, "Выбери, как вывести результат:", reply_markup=kb_coords_pick_output())
         return
 
     if data.startswith("coords:out:"):
         mode = data.split(":")[-1]
         if mode not in ("chat", "csv"):
-            await q.edit_message_text("Не понял формат вывода.", reply_markup=kb_coords_main())
+            sync_globals_from_context(context)
+            await safe_edit(q, "Не понял формат вывода.", reply_markup=kb_coords_main())
             return
         context.user_data["coords_out_mode"] = "Показать в чате" if mode == "chat" else "Файл CSV"
         context.user_data["coords_out_mode_code"] = mode
         sync_globals_from_context(context)
-        await q.edit_message_text("✅ Формат вывода сохранён.", reply_markup=kb_coords_main())
+        await safe_edit(q, "✅ Формат вывода сохранён.", reply_markup=kb_coords_main())
         return
 
     if data == "coords:ready":
-        # проверка настроек
         src = context.user_data.get("coords_src")
         dst = context.user_data.get("coords_dst")
         out_mode = context.user_data.get("coords_out_mode_code")
         if not src or not dst or not out_mode:
             sync_globals_from_context(context)
-            await q.edit_message_text(
+            await safe_edit(
+                q,
                 "Нужно выбрать ВСЁ: исходную СК, конечную СК и формат вывода.",
                 reply_markup=kb_coords_main()
             )
             return
         context.user_data["awaiting"] = "coords_input"
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "✅ Готово.\n"
             "Теперь пришли координаты:\n"
             "- текстом\n"
             "- фото\n"
             "- файлом txt/csv\n\n"
-            "Формат текста: каждая строка содержит 2 числа (X Y) — я возьму первые два.",
+            "Формат текста: каждая строка содержит 2 числа (X Y) — беру первые два.",
             reply_markup=kb_coords_ready()
         )
         return
 
     if data == "coords:manual":
         context.user_data["awaiting"] = "coords_manual"
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "✍️ Ввод координат вручную.\n"
             "Пришли:\n"
             "72853345 551668\n"
@@ -664,9 +682,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == "coords:photo_help":
         context.user_data["awaiting"] = "coords_photo"
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "📷 Пришли фото с координатами.\n"
-            "Я распознаю X/Y и пересчитаю по выбранным СК.\n"
             "Если где-то не уверен — поставлю '?' и попрошу перепроверить.",
             reply_markup=kb_coords_ready()
         )
@@ -674,10 +692,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == "coords:file_help":
         context.user_data["awaiting"] = "coords_file"
-        await q.edit_message_text(
+        await safe_edit(
+            q,
             "📎 Пришли файл .txt или .csv.\n"
-            "Я возьму из каждой строки первые 2 числа как X и Y.\n"
-            "Разделители могут быть пробел/таб/; /, — главное, чтобы числа были.",
+            "Из каждой строки возьму первые 2 числа как X и Y.",
             reply_markup=kb_coords_ready()
         )
         return
@@ -685,31 +703,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # ====== CADASTRE ======
     if data == "cad:manual":
         context.user_data["awaiting"] = "cad_manual"
-        await q.edit_message_text(
-            "✍️ Введи кадастровый номер (формат типа 89:35:800113:31):",
-            reply_markup=kb_land_cadnum()
-        )
+        await safe_edit(q, "✍️ Введи кадастровый номер (типа 89:35:800113:31):", reply_markup=kb_land_cadnum())
         return
 
     if data == "cad:photo_help":
         context.user_data["awaiting"] = "cad_photo"
-        await q.edit_message_text(
-            "📷 Пришли фото, где есть кадастровый номер.\n"
-            "Я распознаю и попробую получить сведения.",
-            reply_markup=kb_land_cadnum()
-        )
+        await safe_edit(q, "📷 Пришли фото, где есть кадастровый номер.", reply_markup=kb_land_cadnum())
         return
 
     if data == "cad:file_help":
         context.user_data["awaiting"] = "cad_file"
-        await q.edit_message_text(
-            "📎 Пришли файл .txt или .csv с кадастровыми номерами.\n"
-            "Я найду все КН в тексте и выведу сведения по каждому (по очереди).",
-            reply_markup=kb_land_cadnum()
-        )
+        await safe_edit(q, "📎 Пришли файл .txt или .csv с кадастровыми номерами.", reply_markup=kb_land_cadnum())
         return
 
-    await q.edit_message_text("Не понял команду. Нажми /menu", reply_markup=kb_root())
+    await safe_edit(q, "Не понял команду. Нажми /menu", reply_markup=kb_root())
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -717,30 +724,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     awaiting = context.user_data.get("awaiting")
     text = update.message.text or ""
 
-    # ---- COORDS INPUT (text) ----
+    # COORDS text
     if awaiting in ("coords_input", "coords_manual") or mode == "mine_coords":
-        # если пользователь в координатах и прислал числа — пробуем пересчитать
         src = context.user_data.get("coords_src")
         dst = context.user_data.get("coords_dst")
         out_mode = context.user_data.get("coords_out_mode_code")
-
         if src and dst and out_mode:
             points = parse_points_from_text(text)
             if points:
                 await do_transform_and_respond(update, context, points)
                 return
 
-    # ---- CAD INPUT (text) ----
+    # CAD text
     if awaiting == "cad_manual" or mode == "land_cadnum":
         cadnums = parse_cadnums_from_text(text)
         if not cadnums:
             await update.message.reply_text(
-                "Не вижу корректный кадастровый номер (формат типа 89:35:800113:31). Попробуй ещё раз.",
+                "Не вижу корректный кадастровый номер (типа 89:35:800113:31).",
                 reply_markup=kb_land_cadnum()
             )
             return
 
-        # если несколько — обработаем по одному
         for cad in cadnums:
             await update.message.reply_text(f"Запрашиваю сведения по КН: {cad} …")
             try:
@@ -768,10 +772,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     b = await f.download_as_bytearray()
     image_b64 = base64.b64encode(bytes(b)).decode("utf-8")
 
-    # ---- COORDS PHOTO ----
+    # COORDS photo
     if awaiting == "coords_photo" or (mode == "mine_coords" and context.user_data.get("coords_src")):
         await update.message.reply_text("Распознаю координаты с фото…")
-
         system_add = (
             "Распознай координаты X и Y.\n"
             "Верни строго:\n"
@@ -798,7 +801,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text(
                 "Не уверен в распознавании.\n\n"
                 f"{raw}\n\n"
-                "Скопируй и пришли координаты вручную (правильно), либо пришли более чёткое фото.",
+                "Пришли координаты вручную (точно) или более чёткое фото.",
                 reply_markup=kb_coords_ready()
             )
             return
@@ -806,21 +809,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         x = _clean_num(x_s)
         y = _clean_num(y_s)
         if x is None or y is None:
-            await update.message.reply_text(
-                "Не смог преобразовать распознанные числа.\n\n"
-                f"{raw}\n\n"
-                "Пришли координаты вручную.",
-                reply_markup=kb_coords_ready()
-            )
+            await update.message.reply_text("Не смог преобразовать распознанные числа. Пришли вручную.", reply_markup=kb_coords_ready())
             return
 
         await do_transform_and_respond(update, context, [(x, y)])
         return
 
-    # ---- CAD PHOTO ----
+    # CAD photo
     if awaiting == "cad_photo" or mode == "land_cadnum":
         await update.message.reply_text("Распознаю кадастровый номер с фото…")
-
         system_add = (
             "Распознай кадастровый номер РФ.\n"
             "Не выдумывай.\n"
@@ -850,12 +847,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         cadnums = parse_cadnums_from_text(cad_guess)
         if len(cadnums) != 1:
-            await update.message.reply_text(
-                "Не могу уверенно выделить корректный КН.\n\n"
-                f"{raw}\n\n"
-                "Пришли КН вручную.",
-                reply_markup=kb_land_cadnum()
-            )
+            await update.message.reply_text("Не могу выделить корректный КН. Пришли вручную.", reply_markup=kb_land_cadnum())
             return
 
         cad = cadnums[0]
@@ -886,56 +878,38 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     filename = (doc.file_name or "").lower()
     if not (filename.endswith(".txt") or filename.endswith(".csv")):
-        await update.message.reply_text(
-            "Поддерживаю пока только .txt и .csv.\n"
-            "Сохрани как txt/csv и пришли снова.",
-        )
+        await update.message.reply_text("Поддерживаю пока только .txt и .csv.", reply_markup=kb_root())
         return
 
     file = await doc.get_file()
     b = await file.download_as_bytearray()
-    text = None
     try:
         text = bytes(b).decode("utf-8")
     except Exception:
-        try:
-            text = bytes(b).decode("cp1251", errors="ignore")
-        except Exception:
-            text = bytes(b).decode("utf-8", errors="ignore")
+        text = bytes(b).decode("cp1251", errors="ignore")
 
-    # ---- COORDS FILE ----
+    # COORDS file
     if awaiting == "coords_file" or (mode == "mine_coords" and context.user_data.get("coords_src")):
         src = context.user_data.get("coords_src")
         dst = context.user_data.get("coords_dst")
         out_mode = context.user_data.get("coords_out_mode_code")
-
         if not (src and dst and out_mode):
-            await update.message.reply_text(
-                "Сначала настрой исходную/конечную СК и формат вывода.\n"
-                "Открой: Маркшейдерия → Пересчёт координат.",
-                reply_markup=kb_mine()
-            )
+            await update.message.reply_text("Сначала настрой СК и вывод.", reply_markup=kb_mine())
             return
 
         points = parse_points_from_text(text)
         if not points:
-            await update.message.reply_text(
-                "В файле не нашёл координаты. Нужно, чтобы в строках были числа (X Y).",
-                reply_markup=kb_coords_ready()
-            )
+            await update.message.reply_text("В файле не нашёл координаты (X Y).", reply_markup=kb_coords_ready())
             return
 
         await do_transform_and_respond(update, context, points, filename_hint=os.path.splitext(filename)[0])
         return
 
-    # ---- CAD FILE ----
+    # CAD file
     if awaiting == "cad_file" or mode == "land_cadnum":
         cadnums = parse_cadnums_from_text(text)
         if not cadnums:
-            await update.message.reply_text(
-                "В файле не нашёл кадастровых номеров (формат 89:35:800113:31).",
-                reply_markup=kb_land_cadnum()
-            )
+            await update.message.reply_text("В файле не нашёл кадастровых номеров.", reply_markup=kb_land_cadnum())
             return
 
         await update.message.reply_text(f"Нашёл КН: {len(cadnums)} шт. Начинаю запрос…")
@@ -965,10 +939,7 @@ async def do_transform_and_respond(
     out_mode = context.user_data.get("coords_out_mode_code")
 
     if not (src and dst and out_mode):
-        await update.message.reply_text(
-            "Не заданы СК/вывод. Открой: Маркшейдерия → Пересчёт координат.",
-            reply_markup=kb_mine()
-        )
+        await update.message.reply_text("Не заданы СК/вывод.", reply_markup=kb_mine())
         return
 
     try:
@@ -983,13 +954,9 @@ async def do_transform_and_respond(
         return
 
     if out_mode == "chat":
-        await update.message.reply_text(
-            "✅ Результат:\n\n" + format_points_table(out_points),
-            reply_markup=kb_coords_ready()
-        )
+        await update.message.reply_text("✅ Результат:\n\n" + format_points_table(out_points), reply_markup=kb_coords_ready())
         return
 
-    # csv
     csv_bytes = make_csv_bytes(out_points)
     bio = BytesIO(csv_bytes)
     bio.name = f"{filename_hint}_converted.csv"
