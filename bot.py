@@ -389,9 +389,14 @@ async def fetch_nspd_info(cadnum: str) -> Dict[str, Any]:
     url = "https://nspd.gov.ru/api/geoportal/v2/search/geoportal"
     params = {"thematicSearchId": "1", "query": cadnum}
     headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://nspd.gov.ru/map?thematic=PKK",
-        "User-Agent": "msk-bot/1.0 (+telegram)",
         "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
     }
     timeout = httpx.Timeout(20.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False) as c:
