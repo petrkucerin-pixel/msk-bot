@@ -52,9 +52,22 @@ client = Anthropic(api_key=ANTHROPIC_API_KEY)
 MODEL = "claude-3-haiku-20240307"
 
 SYSTEM_PROMPT_BASE = (
-    "Ты — помощник для маркшейдеров и специалистов по землеустройству.\n"
-    "КРИТИЧНО: при распознавании с фото не выдумывай и не додумывай цифры.\n"
-    "Если цифра/символ неразборчивы — ставь '?' в этом месте.\n"
+    "Ты — Виктор, опытный маркшейдер с 25-летним стажем и специалист по землеустройству. "
+    "Работал на месторождениях газа, конденсата и нефти в Западной Сибири и ЯНАО. "
+    "Отлично знаешь актуальную нормативную базу: ФЗ 'О недрах', ПП РФ 1467, Приказ Минприроды 186, "
+    "Приказ Ростехнадзора 462, СП 11-104-97, ГОСТ Р 51872-2019 и другие. "
+    "Следишь за изменениями в законодательстве по маркшейдерии и землеустройству. "
+    "Отвечаешь как коллега — по существу, с конкретными ссылками на пункты НД, "
+    "предлагаешь практические решения. Если вопрос касается обхода требований — "
+    "даёшь только законные варианты (согласования, исключения, альтернативные методы). "
+    "При общении используй профессиональный но дружелюбный тон. "
+    "КРИТИЧНО при распознавании с фото: не выдумывай и не додумывай цифры. "
+    "Если цифра/символ неразборчивы — ставь '?' в этом месте."
+)
+
+SYSTEM_PROMPT_OCR = (
+    "Распознай текст с фото точно. "
+    "Если символ неразборчив — ставь '?'. Не додумывай цифры."
 )
 
 HELP_TEXT = (
@@ -222,7 +235,6 @@ def kb_root() -> InlineKeyboardMarkup:
 def kb_mine() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("📐 Пересчёт координат", callback_data=_assert_cb("mine:coords"))],
-        [InlineKeyboardButton("📚 Нормативная документация", callback_data=_assert_cb("mine:norms"))],
         [InlineKeyboardButton("🧾 Составление отчёта", callback_data=_assert_cb("mine:report"))],
     ]
     rows += kb_nav(back_to="nav:root", include_menu=True)
@@ -232,7 +244,6 @@ def kb_mine() -> InlineKeyboardMarkup:
 def kb_land() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🏷️ Инфо по кадастровому номеру", callback_data=_assert_cb("land:cadnum"))],
-        [InlineKeyboardButton("📚 Нормативная документация", callback_data=_assert_cb("land:norms"))],
     ]
     rows += kb_nav(back_to="nav:root", include_menu=True)
     return InlineKeyboardMarkup(rows)
@@ -796,7 +807,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(text_out, parse_mode="HTML", disable_web_page_preview=True)
         return
 
-    await update.message.reply_text("Открой /menu", reply_markup=kb_root())
+    # Всё остальное — вопрос эксперту
+    await handle_expert_chat(update, context, text)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -939,6 +951,39 @@ async def do_transform_and_respond(
         caption=f"✅ Готово. {len(out_points)} точек. CSV (разделитель ';').",
         reply_markup=kb_coords_ready(),
     )
+
+
+
+async def handle_expert_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Диалог с экспертом-маркшейдером через Claude."""
+    # Храним историю диалога в user_data
+    history = context.user_data.get("chat_history", [])
+    history.append({"role": "user", "content": text})
+
+    # Ограничиваем историю последними 20 сообщениями
+    if len(history) > 20:
+        history = history[-20:]
+
+    thinking_msg = await update.message.reply_text("💭 Думаю…")
+
+    try:
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=1500,
+            system=SYSTEM_PROMPT_BASE,
+            messages=history,
+        )
+        answer = resp.content[0].text.strip()
+        history.append({"role": "assistant", "content": answer})
+        context.user_data["chat_history"] = history
+
+        await thinking_msg.delete()
+        await update.message.reply_text(answer)
+
+    except Exception as e:
+        logger.exception("Expert chat error")
+        await thinking_msg.delete()
+        await update.message.reply_text(f"Ошибка при обращении к эксперту: {e}")
 
 
 # ================== ERROR HANDLER ==================
