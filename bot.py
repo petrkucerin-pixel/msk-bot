@@ -394,7 +394,7 @@ async def fetch_nspd_info(cadnum: str) -> Dict[str, Any]:
         "Accept": "application/json, text/plain, */*",
     }
     timeout = httpx.Timeout(20.0, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False) as c:
         r = await c.get(url, params=params, headers=headers)
         r.raise_for_status()
         return r.json()
